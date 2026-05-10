@@ -479,7 +479,7 @@ If you cannot access the URL, return {"error": "Could not fetch URL"}.`
   }
   function editRecipe(recipe: Recipe) {
     setEditingRecipeId(recipe.id);
-    setRecipeForm({ notes: "", ...recipe });
+    setRecipeForm({ ...recipe, notes: recipe.notes ?? "" });
     setIngredientsText(recipe.ingredients.map((i) => `${i.qty} ${i.unit} ${i.item}`).join("\n"));
     setMatchLog([]); setActiveMainTab("recipes");
     window.scrollTo({ top: 0, behavior: "smooth" });
