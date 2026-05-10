@@ -311,6 +311,13 @@ export default function Home() {
   const [expandedNotes, setExpandedNotes] = useState<number | null>(null);
   const [mobileDay, setMobileDay] = useState(days[0]);
   const importRef = useRef<HTMLInputElement>(null);
+  // Barcode scanner state
+  const [showBarcodeScanner, setShowBarcodeScanner] = useState(false);
+  const [barcodeManualInput, setBarcodeManualInput] = useState("");
+  const [barcodeStatus, setBarcodeStatus] = useState("");
+  const [isScanningBarcode, setIsScanningBarcode] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
   // Load
   useEffect(() => {
@@ -364,44 +371,23 @@ export default function Home() {
     setRecipes((cur) => [...cur, { ...recipe, id: Date.now(), name: `${recipe.name} (copy)` }]);
   }
 
-  // Feature: URL import via Claude API
+  // URL import — calls our server-side API route (keeps API key server-side)
   async function importFromUrl() {
     const url = urlImportValue.trim();
     if (!url) return;
     setIsImporting(true);
     setImportStatus("Fetching recipe from URL...");
     try {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
+      const response = await fetch("/api/import-recipe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 1000,
-          messages: [{
-            role: "user",
-            content: `Visit this recipe URL and extract the recipe details: ${url}
-
-Return ONLY a JSON object with these exact fields (no markdown, no explanation):
-{
-  "name": "Recipe Name",
-  "category": "Dinner",
-  "tags": "tag1, tag2",
-  "notes": "Brief cooking instructions or notes",
-  "servings": 4,
-  "ingredients": ["1 lb chicken breast", "2 cups rice", "1 tsp salt"]
-}
-
-Category must be one of: Breakfast, Lunch, Dinner, Snack, Side, Dressing, Dessert.
-Ingredients must be plain strings like "1 lb chicken breast" — quantity, unit, then item.
-If you cannot access the URL, return {"error": "Could not fetch URL"}.`
-          }],
-        }),
+        body: JSON.stringify({ url }),
       });
-      const data = await response.json();
-      const text = data.content?.map((c: { type: string; text?: string }) => c.text || "").join("") || "";
-      const clean = text.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(clean);
-      if (parsed.error) { setImportStatus(`Import failed: ${parsed.error}`); return; }
+      const parsed = await response.json();
+      if (!response.ok || parsed.error) {
+        setImportStatus(`Import failed: ${parsed.error || "Unknown error"}`);
+        return;
+      }
       setRecipeForm({
         ...blankRecipe(),
         name: parsed.name || "",
@@ -418,6 +404,107 @@ If you cannot access the URL, return {"error": "Could not fetch URL"}.`
     } catch (e) {
       setImportStatus(`Import failed: ${e instanceof Error ? e.message : "Unknown error"}`);
     } finally { setIsImporting(false); }
+  }
+
+  // Barcode scanner functions
+  async function lookupBarcode(upc: string) {
+    if (!upc.trim()) return;
+    setIsScanningBarcode(true);
+    setBarcodeStatus('Looking up barcode ' + upc.trim() + '...');
+    try {
+      const res = await fetch('https://world.openfoodfacts.org/api/v2/product/' + upc.trim() + '.json');
+      const data = await res.json();
+      if (data.status !== 1 || !data.product) {
+        setBarcodeStatus('Product not found in Open Food Facts database. Try entering ingredients manually.');
+        return;
+      }
+      const p = data.product;
+      const n = p.nutriments || {};
+      const servingG = p.serving_quantity ? Number(p.serving_quantity) : 100;
+      const perG = (val: number | undefined, per100: number | undefined) => {
+        if (val !== undefined) return val;
+        if (per100 !== undefined) return (per100 * servingG) / 100;
+        return 0;
+      };
+      const cal  = Math.round(perG(n['energy-kcal_serving'], n['energy-kcal_100g']));
+      const pro  = Math.round(perG(n['proteins_serving'],    n['proteins_100g']));
+      const fat  = Math.round(perG(n['fat_serving'],         n['fat_100g']));
+      const carb = Math.round(perG(n['carbohydrates_serving'], n['carbohydrates_100g']));
+      const fib  = Math.round(perG(n['fiber_serving'],        n['fiber_100g']));
+      const name = p.product_name || p.product_name_en || 'Scanned Product';
+      const servings = p.servings_quantity ? Number(p.servings_quantity) : 1;
+      // Build ingredient line from serving size if available
+      const servingSize = p.serving_size || '';
+      const ingredientLine = servingSize ? ('1 serving ' + name) : ('100 g ' + name);
+      setRecipeForm((cur) => ({
+        ...cur,
+        name: name,
+        category: 'Snack',
+        servings: servings || 1,
+        calories: cal,
+        protein: pro,
+        fat: fat,
+        carbs: carb,
+        fiber: fib,
+        notes: 'Imported from barcode ' + upc.trim() + (servingSize ? '. Serving size: ' + servingSize : '') + (p.brands ? '. Brand: ' + p.brands : ''),
+      }));
+      setIngredientsText(ingredientLine);
+      setBarcodeStatus('✅ Found: ' + name + (p.brands ? ' (' + p.brands + ')' : '') + '. ' + cal + ' cal · ' + pro + 'g pro per serving. Review and save.');
+      setShowBarcodeScanner(false);
+      stopCamera();
+    } catch {
+      setBarcodeStatus('Lookup failed. Check your connection and try again.');
+    } finally {
+      setIsScanningBarcode(false);
+    }
+  }
+
+  async function startCamera() {
+    setBarcodeStatus('Starting camera...');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.play();
+      }
+      setBarcodeStatus('Point camera at barcode. Scanning...');
+      scanLoop();
+    } catch {
+      setBarcodeStatus('Camera access denied. Use manual entry below.');
+    }
+  }
+
+  function stopCamera() {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+  }
+
+  async function scanLoop() {
+    // Use BarcodeDetector if available (Chrome, Edge, Android browsers)
+    const BD = (window as unknown as { BarcodeDetector?: { new(opts: object): { detect(el: HTMLVideoElement): Promise<{ rawValue: string }[]> } } }).BarcodeDetector;
+    if (!BD) {
+      setBarcodeStatus('Camera scanning not supported on this browser. Enter the barcode number manually below.');
+      return;
+    }
+    const detector = new BD({ formats: ['ean_13','ean_8','upc_a','upc_e','code_128','code_39'] });
+    const detect = async () => {
+      if (!videoRef.current || !streamRef.current) return;
+      try {
+        const results = await detector.detect(videoRef.current);
+        if (results.length > 0) {
+          const code = results[0].rawValue;
+          setBarcodeStatus('Barcode detected: ' + code + '. Looking up...');
+          stopCamera();
+          await lookupBarcode(code);
+          return;
+        }
+      } catch { /* ignore detection errors */ }
+      if (streamRef.current) setTimeout(detect, 400);
+    };
+    setTimeout(detect, 500);
   }
 
   async function estimateNutrition() {
@@ -956,6 +1043,62 @@ If you cannot access the URL, return {"error": "Could not fetch URL"}.`
                 </button>
               </div>
               {importStatus && <p className="mt-2 text-sm text-slate-600">{importStatus}</p>}
+            </section>
+
+            {/* Barcode Scanner */}
+            <section className="rounded-2xl bg-white p-4 shadow">
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="text-lg font-semibold">📷 Scan Barcode</h2>
+                <button
+                  onClick={() => { setShowBarcodeScanner(!showBarcodeScanner); setBarcodeStatus(""); if (showBarcodeScanner) stopCamera(); }}
+                  className="rounded border px-3 py-1.5 text-sm hover:bg-slate-50">
+                  {showBarcodeScanner ? "Hide Scanner" : "Open Scanner"}
+                </button>
+              </div>
+              {showBarcodeScanner && (
+                <div className="space-y-3">
+                  {/* Camera view */}
+                  <div className="relative rounded-xl overflow-hidden bg-black aspect-video max-h-56">
+                    <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
+                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                      <div className="border-2 border-white/60 rounded w-48 h-24 shadow-inner" />
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={startCamera} disabled={isScanningBarcode} className="rounded bg-blue-600 px-4 py-2 text-sm text-white disabled:bg-slate-400">
+                      📷 Start Camera
+                    </button>
+                    <button onClick={() => { stopCamera(); setBarcodeStatus(""); }} className="rounded border px-4 py-2 text-sm hover:bg-slate-50">
+                      Stop
+                    </button>
+                  </div>
+                  {/* Manual UPC entry fallback */}
+                  <div>
+                    <p className="text-xs text-slate-500 mb-1">Or type the barcode number manually:</p>
+                    <div className="flex gap-2">
+                      <input
+                        className="flex-1 rounded border p-2 text-sm font-mono"
+                        placeholder="e.g. 012345678901"
+                        value={barcodeManualInput}
+                        onChange={(e) => setBarcodeManualInput(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") { lookupBarcode(barcodeManualInput); setBarcodeManualInput(""); } }}
+                      />
+                      <button
+                        onClick={() => { lookupBarcode(barcodeManualInput); setBarcodeManualInput(""); }}
+                        disabled={isScanningBarcode || !barcodeManualInput.trim()}
+                        className="rounded bg-emerald-600 px-4 py-2 text-sm text-white disabled:bg-slate-400">
+                        {isScanningBarcode ? "Looking up..." : "Look Up"}
+                      </button>
+                    </div>
+                  </div>
+                  {barcodeStatus && (
+                    <p className={"text-sm rounded p-2 " + (barcodeStatus.startsWith("✅") ? "bg-green-50 text-green-700" : "bg-slate-50 text-slate-600")}>
+                      {barcodeStatus}
+                    </p>
+                  )}
+                  <p className="text-xs text-slate-400">Powered by Open Food Facts — free, no API key required. Works best on packaged foods with EAN-13 or UPC barcodes.</p>
+                </div>
+              )}
             </section>
 
             {/* Add/Edit form */}
