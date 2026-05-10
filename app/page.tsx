@@ -57,24 +57,94 @@ type MatchLog = {
   matched: string;
   dataType: string;
   score: number;
+  source: "local" | "usda";
 };
 
-const STORAGE_KEY = "recipe-planner-phase-2-better-usda-v1";
-const OLD_STORAGE_KEY = "recipe-planner-phase-2-usda-v1";
+// ---------------------------------------------------------------------------
+// Local nutrition rules — per 100g
+// Calories, protein, fat, carbs, fiber — all per 100g
+// ---------------------------------------------------------------------------
+type LocalNutrition = { cal: number; protein: number; fat: number; carbs: number; fiber: number };
+
+const localNutritionRules: { pattern: RegExp; label: string; nutrition: LocalNutrition }[] = [
+  // Oils
+  { pattern: /avocado oil/i,            label: "Avocado Oil",         nutrition: { cal: 884, protein: 0,    fat: 100,  carbs: 0,   fiber: 0 } },
+  { pattern: /olive oil/i,              label: "Olive Oil",           nutrition: { cal: 884, protein: 0,    fat: 100,  carbs: 0,   fiber: 0 } },
+  { pattern: /coconut oil/i,            label: "Coconut Oil",         nutrition: { cal: 892, protein: 0,    fat: 99,   carbs: 0,   fiber: 0 } },
+  { pattern: /vegetable oil|canola oil/i, label: "Vegetable Oil",     nutrition: { cal: 884, protein: 0,    fat: 100,  carbs: 0,   fiber: 0 } },
+  { pattern: /sesame oil/i,             label: "Sesame Oil",          nutrition: { cal: 884, protein: 0,    fat: 100,  carbs: 0,   fiber: 0 } },
+  // Vinegars
+  { pattern: /balsamic vinegar/i,       label: "Balsamic Vinegar",    nutrition: { cal: 88,  protein: 0.5,  fat: 0,    carbs: 17,  fiber: 0 } },
+  { pattern: /apple cider vinegar/i,    label: "Apple Cider Vinegar", nutrition: { cal: 21,  protein: 0,    fat: 0,    carbs: 0.9, fiber: 0 } },
+  { pattern: /red wine vinegar/i,       label: "Red Wine Vinegar",    nutrition: { cal: 19,  protein: 0,    fat: 0,    carbs: 0.3, fiber: 0 } },
+  { pattern: /white wine vinegar|white vinegar|rice vinegar/i, label: "White Vinegar", nutrition: { cal: 18, protein: 0, fat: 0, carbs: 0.6, fiber: 0 } },
+  { pattern: /vinegar/i,                label: "Vinegar",             nutrition: { cal: 18,  protein: 0,    fat: 0,    carbs: 0.6, fiber: 0 } },
+  // Mustards
+  { pattern: /dijon mustard/i,          label: "Dijon Mustard",       nutrition: { cal: 66,  protein: 3.8,  fat: 3.6,  carbs: 5.3, fiber: 2 } },
+  { pattern: /yellow mustard/i,         label: "Yellow Mustard",      nutrition: { cal: 60,  protein: 3.7,  fat: 3.3,  carbs: 5.8, fiber: 2 } },
+  { pattern: /mustard/i,                label: "Mustard",             nutrition: { cal: 63,  protein: 3.7,  fat: 3.4,  carbs: 5.5, fiber: 2 } },
+  // Condiments
+  { pattern: /soy sauce/i,              label: "Soy Sauce",           nutrition: { cal: 53,  protein: 8.1,  fat: 0.1,  carbs: 4.9, fiber: 0.8 } },
+  { pattern: /hot sauce/i,              label: "Hot Sauce",           nutrition: { cal: 11,  protein: 0.5,  fat: 0.4,  carbs: 0.9, fiber: 0.2 } },
+  { pattern: /worcestershire/i,         label: "Worcestershire Sauce",nutrition: { cal: 78,  protein: 0,    fat: 0,    carbs: 19,  fiber: 0 } },
+  { pattern: /honey/i,                  label: "Honey",               nutrition: { cal: 304, protein: 0.3,  fat: 0,    carbs: 82,  fiber: 0.2 } },
+  { pattern: /maple syrup/i,            label: "Maple Syrup",         nutrition: { cal: 260, protein: 0,    fat: 0.1,  carbs: 67,  fiber: 0 } },
+  { pattern: /ketchup/i,                label: "Ketchup",             nutrition: { cal: 100, protein: 1.7,  fat: 0.1,  carbs: 27,  fiber: 0.3 } },
+  { pattern: /mayo|mayonnaise/i,        label: "Mayonnaise",          nutrition: { cal: 680, protein: 1,    fat: 75,   carbs: 0.6, fiber: 0 } },
+  // Near-zero seasonings — skip
+  { pattern: /^salt$|kosher salt|sea salt|table salt/i, label: "Salt",         nutrition: { cal: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 } },
+  { pattern: /black pepper|white pepper|^pepper$/i,     label: "Black Pepper", nutrition: { cal: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 } },
+  { pattern: /^garlic powder$/i,        label: "Garlic Powder (negligible)", nutrition: { cal: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 } },
+  { pattern: /^onion powder$/i,         label: "Onion Powder (negligible)",  nutrition: { cal: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 } },
+  { pattern: /cumin|paprika|oregano|basil|thyme|rosemary|chili powder|cayenne|cinnamon|nutmeg|turmeric|coriander|seasoning|spice mix|italian seasoning|taco seasoning/i,
+    label: "Spice/Seasoning (negligible)", nutrition: { cal: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 } },
+];
+
+// Sanity cap: a single recipe total should never exceed this
+const MAX_RECIPE_CALORIES = 6000;
+
+const STORAGE_KEY = "recipe-planner-phase-2-alias-normalized-v1";
+const OLD_STORAGE_KEYS = [
+  "recipe-planner-phase-2-better-usda-v1",
+  "recipe-planner-phase-2-usda-v1",
+  "recipe-planner-phase-2-v1",
+  "recipe-planner-phase-1-v1",
+];
 
 const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const mealSlots: MealSlot[] = ["Breakfast", "Lunch", "Dinner", "Snack"];
 
 const defaultFamily: FamilyMember[] = [
-  { id: 1, name: "Kyle", mealCalories: 700, mealProtein: 60, mealFat: 25, mealCarbs: 70, mealFiber: 10 },
-  { id: 2, name: "Kathie", mealCalories: 500, mealProtein: 40, mealFat: 18, mealCarbs: 50, mealFiber: 8 },
-  { id: 3, name: "Koen", mealCalories: 450, mealProtein: 30, mealFat: 17, mealCarbs: 55, mealFiber: 7 },
-  { id: 4, name: "Kole", mealCalories: 450, mealProtein: 30, mealFat: 17, mealCarbs: 55, mealFiber: 7 },
+  { id: 1, name: "Kyle",   mealCalories: 700, mealProtein: 60, mealFat: 25, mealCarbs: 70, mealFiber: 10 },
+  { id: 2, name: "Kathie", mealCalories: 500, mealProtein: 40, mealFat: 18, mealCarbs: 50, mealFiber: 8  },
+  { id: 3, name: "Koen",   mealCalories: 450, mealProtein: 30, mealFat: 17, mealCarbs: 55, mealFiber: 7  },
+  { id: 4, name: "Kole",   mealCalories: 450, mealProtein: 30, mealFat: 17, mealCarbs: 55, mealFiber: 7  },
 ];
 
 const grocerySections = ["Produce", "Meat", "Dairy", "Frozen", "Pantry", "Bakery", "Canned Goods", "Spices", "Other"];
 
-const noiseWords = ["fresh", "raw", "cooked", "diced", "chopped", "sliced", "shredded", "minced", "boneless", "skinless", "large", "small", "medium", "extra", "lean", "organic"];
+const noiseWords = [
+  "fresh", "raw", "cooked", "diced", "chopped", "sliced", "shredded", "minced",
+  "boneless", "skinless", "large", "small", "medium", "extra", "lean",
+  "organic", "use", "press", "or", "and",
+];
+
+const ingredientAliases: { pattern: RegExp; replacement: string }[] = [
+  { pattern: /garlic.*clove|garlic clove|clove garlic|cloves garlic|garlic press/i, replacement: "garlic" },
+  { pattern: /black pepper spice|pepper spice|ground black pepper|black pepper/i,   replacement: "black pepper" },
+  { pattern: /dijon.*mustard|spicy brown mustard|brown mustard|dijon mustard/i,     replacement: "dijon mustard" },
+  { pattern: /avocado oil/i,                                                         replacement: "avocado oil" },
+  { pattern: /balsamic vinegar|balsamic/i,                                           replacement: "balsamic vinegar" },
+  { pattern: /extra virgin olive oil|olive oil/i,                                    replacement: "olive oil" },
+  { pattern: /kosher salt|sea salt|table salt|^salt$/i,                              replacement: "salt" },
+  { pattern: /chicken breast/i,                                                       replacement: "chicken breast" },
+  { pattern: /ground beef/i,                                                          replacement: "ground beef" },
+  { pattern: /ground turkey/i,                                                        replacement: "ground turkey" },
+  { pattern: /white rice|brown rice/i,                                                replacement: "rice" },
+  { pattern: /romaine lettuce|shredded lettuce|lettuce/i,                             replacement: "lettuce" },
+  { pattern: /black beans/i,                                                          replacement: "black beans" },
+  { pattern: /tortilla|tortillas/i,                                                   replacement: "tortilla" },
+];
 
 function createEmptyMealPlan(): MealPlan {
   return days.reduce((plan, day) => {
@@ -83,20 +153,49 @@ function createEmptyMealPlan(): MealPlan {
   }, {} as MealPlan);
 }
 
+function normalizeIngredientName(item: string) {
+  const withoutNotes = item
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const alias = ingredientAliases.find((entry) => entry.pattern.test(withoutNotes));
+  if (alias) return alias.replacement;
+  return withoutNotes;
+}
+
+function cleanIngredientForSearch(item: string) {
+  const normalized = normalizeIngredientName(item);
+  return normalized
+    .split(/\s+/)
+    .filter((word) => word && !noiseWords.includes(word))
+    .join(" ")
+    .trim();
+}
+
+function getLocalRule(normalizedItem: string): { label: string; nutrition: LocalNutrition } | null {
+  const match = localNutritionRules.find((rule) => rule.pattern.test(normalizedItem));
+  return match ? { label: match.label, nutrition: match.nutrition } : null;
+}
+
 function sectionForItem(item: string) {
-  const value = item.toLowerCase();
+  const value = normalizeIngredientName(item);
   if (/chicken|beef|turkey|pork|fish|salmon|shrimp|bacon|sausage/.test(value)) return "Meat";
   if (/milk|cheese|yogurt|butter|cream|egg/.test(value)) return "Dairy";
-  if (/lettuce|tomato|onion|pepper|broccoli|carrot|apple|banana|potato|avocado|cilantro|spinach/.test(value)) return "Produce";
+  if (/lettuce|tomato|onion|pepper|broccoli|carrot|apple|banana|potato|avocado|cilantro|spinach|garlic/.test(value)) return "Produce";
   if (/bread|tortilla|bun|roll|bagel/.test(value)) return "Bakery";
   if (/beans|soup|salsa|tomato sauce|marinara|corn/.test(value)) return "Canned Goods";
-  if (/salt|pepper|garlic|paprika|cumin|seasoning|oregano|basil|chili/.test(value)) return "Spices";
+  if (/salt|pepper|paprika|cumin|seasoning|oregano|basil|chili|mustard/.test(value)) return "Spices";
   if (/frozen/.test(value)) return "Frozen";
-  if (/rice|pasta|flour|sugar|oil|oats|cereal|chips/.test(value)) return "Pantry";
+  if (/rice|pasta|flour|sugar|oil|oats|cereal|chips|vinegar/.test(value)) return "Pantry";
   return "Other";
 }
 
 function parseAmount(value: string) {
+  const mixedNumber = value.match(/^(\d+)\s+(\d+)\/(\d+)$/);
+  if (mixedNumber) return Number(mixedNumber[1]) + Number(mixedNumber[2]) / Number(mixedNumber[3]);
   if (value.includes("/")) {
     const [top, bottom] = value.split("/").map(Number);
     return bottom ? top / bottom : 1;
@@ -104,23 +203,29 @@ function parseAmount(value: string) {
   return Number(value) || 1;
 }
 
-function cleanIngredientForSearch(item: string) {
-  return item
-    .toLowerCase()
-    .replace(/\([^)]*\)/g, "")
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter((word) => word && !noiseWords.includes(word))
-    .join(" ")
-    .trim();
-}
-
 function parseIngredientLine(line: string): Ingredient {
-  const cleaned = line.replace(/^[-*•]\s*/, "").trim();
+  // Strip bullet markers, then remove ALL parenthetical notes like "(2 tablespoons)" or "(1/3 cup)"
+  // These appear in recipe formats like "30 ml (2 tablespoons) balsamic vinegar"
+  const cleaned = line
+    .replace(/^[-*•]\s*/, "")
+    .replace(/\([^)]*\)/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
   const parts = cleaned.split(/\s+/);
-  const qty = parseAmount(parts[0] || "1");
-  const unit = parts[1] || "each";
-  const item = parts.slice(2).join(" ") || cleaned;
+
+  let qty = parseAmount(parts[0] || "1");
+  let unitIndex = 1;
+
+  // Handle mixed fractions like "1 1/2"
+  if (parts.length >= 3 && parts[1]?.includes("/")) {
+    qty = parseAmount(`${parts[0]} ${parts[1]}`);
+    unitIndex = 2;
+  }
+
+  const unit = parts[unitIndex] || "each";
+  const rawItem = parts.slice(unitIndex + 1).join(" ") || cleaned;
+  const item = normalizeIngredientName(rawItem);
   return { qty, unit, item, section: sectionForItem(item) };
 }
 
@@ -130,47 +235,79 @@ function blankRecipe(): Recipe {
 
 function getNutrient(food: UsdaFood, names: string[]) {
   const nutrient = food.foodNutrients?.find((item) => {
-    const nutrientName = item.nutrientName?.toLowerCase() || "";
-    return names.some((name) => nutrientName.includes(name));
+    const n = item.nutrientName?.toLowerCase() || "";
+    return names.some((name) => n.includes(name));
   });
   return Number(nutrient?.value || 0);
 }
 
-function unitToApproxGramMultiplier(unit: string) {
-  const normalized = unit.toLowerCase();
-  if (["g", "gram", "grams"].includes(normalized)) return 1;
-  if (["kg", "kilogram", "kilograms"].includes(normalized)) return 1000;
-  if (["oz", "ounce", "ounces"].includes(normalized)) return 28.35;
-  if (["lb", "lbs", "pound", "pounds"].includes(normalized)) return 453.6;
-  if (["cup", "cups"].includes(normalized)) return 240;
-  if (["tbsp", "tablespoon", "tablespoons"].includes(normalized)) return 15;
-  if (["tsp", "teaspoon", "teaspoons"].includes(normalized)) return 5;
-  if (["each", "ea", "ct", "count"].includes(normalized)) return 100;
+function unitToApproxGramMultiplier(unit: string, item = "") {
+  const u = unit.toLowerCase();
+  const i = normalizeIngredientName(item);
+
+  if (["g", "gram", "grams"].includes(u)) return 1;
+  if (["kg", "kilogram", "kilograms"].includes(u)) return 1000;
+  if (["oz", "ounce", "ounces"].includes(u)) return 28.35;
+  if (["lb", "lbs", "pound", "pounds"].includes(u)) return 453.6;
+  // ml and l — 1 ml ≈ 1g for most liquids
+  if (["ml", "milliliter", "milliliters", "millilitre", "millilitres"].includes(u)) return 1;
+  if (["l", "liter", "liters", "litre", "litres"].includes(u)) return 1000;
+
+  if (["cup", "cups"].includes(u)) {
+    if (/oil/.test(i)) return 218;
+    if (/vinegar/.test(i)) return 240;
+    if (/rice|pasta/.test(i)) return 185;
+    if (/cheese/.test(i)) return 113;
+    if (/lettuce/.test(i)) return 47;
+    if (/salsa/.test(i)) return 260;
+    if (/beans/.test(i)) return 172;
+    return 240;
+  }
+  if (["tbsp", "tablespoon", "tablespoons"].includes(u)) {
+    if (/oil/.test(i)) return 13.6;
+    if (/vinegar/.test(i)) return 15;
+    if (/mustard|honey|syrup|ketchup/.test(i)) return 21;
+    if (/mayo/.test(i)) return 14;
+    if (/soy sauce/.test(i)) return 16;
+    return 15;
+  }
+  if (["tsp", "teaspoon", "teaspoons"].includes(u)) {
+    if (/oil/.test(i)) return 4.5;
+    if (/salt/.test(i)) return 6;
+    if (/pepper|spice|seasoning/.test(i)) return 2.3;
+    if (/mustard/.test(i)) return 5;
+    return 5;
+  }
+  if (["clove", "cloves"].includes(u)) return 3;
+  if (["each", "ea", "ct", "count"].includes(u)) {
+    if (/tortilla/.test(i)) return 45;
+    if (/egg/.test(i)) return 50;
+    return 100;
+  }
   return 100;
 }
 
 function scoreUsdaFood(food: UsdaFood, originalIngredient: string) {
   const description = (food.description || "").toLowerCase();
   const dataType = (food.dataType || "").toLowerCase();
-  const searchTerms = cleanIngredientForSearch(originalIngredient).split(/\s+/).filter(Boolean);
+  const normalizedIngredient = normalizeIngredientName(originalIngredient);
+  const searchTerms = cleanIngredientForSearch(normalizedIngredient).split(/\s+/).filter(Boolean);
   let score = 0;
 
-  searchTerms.forEach((term) => {
-    if (description.includes(term)) score += 10;
-  });
-
+  searchTerms.forEach((term) => { if (description.includes(term)) score += 10; });
   if (dataType.includes("foundation")) score += 40;
-  if (dataType.includes("sr legacy")) score += 35;
-  if (dataType.includes("survey")) score += 20;
-  if (dataType.includes("branded")) score -= 25;
-  if (food.brandOwner) score -= 15;
+  if (dataType.includes("sr legacy"))  score += 35;
+  if (dataType.includes("survey"))     score += 20;
+  if (dataType.includes("branded"))    score -= 25;
+  if (food.brandOwner)                 score -= 15;
 
   if (/raw|uncooked/.test(originalIngredient.toLowerCase()) && /raw/.test(description)) score += 15;
-  if (/cooked/.test(originalIngredient.toLowerCase()) && /cooked/.test(description)) score += 15;
-  if (/breast/.test(originalIngredient.toLowerCase()) && /breast/.test(description)) score += 12;
-  if (/lean/.test(originalIngredient.toLowerCase()) && /lean/.test(description)) score += 8;
-
+  if (/cooked/.test(originalIngredient.toLowerCase()) && /cooked/.test(description))    score += 15;
+  if (/breast/.test(normalizedIngredient) && /breast/.test(description)) score += 12;
+  if (/lean/.test(originalIngredient.toLowerCase()) && /lean/.test(description))        score += 8;
   if (/with salt|prepared|restaurant|fast food|babyfood|formula/.test(description)) score -= 20;
+  if (/cloves, ground/.test(description) && /garlic/.test(normalizedIngredient)) score -= 100;
+
   return score;
 }
 
@@ -188,12 +325,12 @@ export default function Home() {
   const [ingredientsText, setIngredientsText] = useState("1 lb chicken breast\n8 each tortillas\n1 cup salsa");
   const [scaleBy, setScaleBy] = useState<"calories" | "protein">("calories");
   const [mealPlan, setMealPlan] = useState<MealPlan>(createEmptyMealPlan());
-  const [usdaStatus, setUsdaStatus] = useState("USDA estimate scores multiple matches and prefers generic USDA foods over branded foods. Review before saving.");
+  const [usdaStatus, setUsdaStatus] = useState("Oils, vinegar, mustard, and spices use built-in local rules. USDA is only called for real foods like meat, grains, and vegetables.");
   const [isEstimating, setIsEstimating] = useState(false);
   const [matchLog, setMatchLog] = useState<MatchLog[]>([]);
 
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(OLD_STORAGE_KEY);
+    const saved = localStorage.getItem(STORAGE_KEY) || OLD_STORAGE_KEYS.map((k) => localStorage.getItem(k)).find(Boolean);
     if (!saved) return;
     const parsed = JSON.parse(saved);
     setFamily(parsed.family || defaultFamily);
@@ -207,22 +344,19 @@ export default function Home() {
   }, [family, recipes, scaleBy, mealPlan]);
 
   function updateFamily(id: number, field: keyof FamilyMember, value: string) {
-    setFamily((current) => current.map((person) => (person.id === id ? { ...person, [field]: field === "name" ? value : Number(value) } : person)));
+    setFamily((cur) => cur.map((p) => (p.id === id ? { ...p, [field]: field === "name" ? value : Number(value) } : p)));
   }
 
   function updateRecipeField(field: keyof Recipe, value: string) {
-    setRecipeForm((current) => ({ ...current, [field]: ["name", "category", "tags"].includes(field) ? value : Number(value) }));
+    setRecipeForm((cur) => ({ ...cur, [field]: ["name", "category", "tags"].includes(field) ? value : Number(value) }));
   }
 
   async function estimateNutritionFromUsda() {
-    const ingredients = ingredientsText.split("\n").map((line) => line.trim()).filter(Boolean).map(parseIngredientLine);
-    if (ingredients.length === 0) {
-      setUsdaStatus("Add ingredients first, then run USDA estimate.");
-      return;
-    }
+    const ingredients = ingredientsText.split("\n").map((l) => l.trim()).filter(Boolean).map(parseIngredientLine);
+    if (ingredients.length === 0) { setUsdaStatus("Add ingredients first, then run estimate."); return; }
 
     setIsEstimating(true);
-    setUsdaStatus("Searching USDA and scoring best ingredient matches...");
+    setUsdaStatus("Estimating nutrition...");
     setMatchLog([]);
 
     const total = { calories: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 };
@@ -231,68 +365,88 @@ export default function Home() {
 
     try {
       for (const ingredient of ingredients) {
-        const cleanedQuery = cleanIngredientForSearch(ingredient.item) || ingredient.item;
-        const response = await fetch(`/api/usda/search?query=${encodeURIComponent(cleanedQuery)}`);
-        if (!response.ok) {
-          missed.push(ingredient.item);
+        const normalizedItem = normalizeIngredientName(ingredient.item);
+        const grams = ingredient.qty * unitToApproxGramMultiplier(ingredient.unit, normalizedItem);
+        const multiplier = grams / 100;
+
+        // Step 1: Try local rule first
+        const localRule = getLocalRule(normalizedItem);
+        if (localRule) {
+          const n = localRule.nutrition;
+          if (n.cal === 0 && n.protein === 0 && n.fat === 0) {
+            matched.push({ ingredient: ingredient.item, matched: `${localRule.label} — negligible amount skipped`, dataType: "Local rule", score: 999, source: "local" });
+          } else {
+            total.calories += n.cal     * multiplier;
+            total.protein  += n.protein * multiplier;
+            total.fat      += n.fat     * multiplier;
+            total.carbs    += n.carbs   * multiplier;
+            total.fiber    += n.fiber   * multiplier;
+            matched.push({ ingredient: ingredient.item, matched: localRule.label, dataType: "Local nutrition rule", score: 999, source: "local" });
+          }
           continue;
         }
+
+        // Step 2: Use USDA for real foods
+        const cleanedQuery = cleanIngredientForSearch(normalizedItem) || normalizedItem;
+        const response = await fetch(`/api/usda/search?query=${encodeURIComponent(cleanedQuery)}`);
+        if (!response.ok) { missed.push(ingredient.item); continue; }
 
         const data = await response.json();
         const foods: UsdaFood[] = data.foods || [];
-        if (foods.length === 0) {
-          missed.push(ingredient.item);
-          continue;
-        }
+        if (foods.length === 0) { missed.push(ingredient.item); continue; }
 
-        const best = chooseBestUsdaFood(foods, ingredient.item);
-        if (!best?.food) {
-          missed.push(ingredient.item);
-          continue;
-        }
+        const best = chooseBestUsdaFood(foods, normalizedItem);
+        if (!best?.food) { missed.push(ingredient.item); continue; }
 
-        const grams = ingredient.qty * unitToApproxGramMultiplier(ingredient.unit);
-        const multiplier = grams / 100;
+        total.calories += getNutrient(best.food, ["energy"])              * multiplier;
+        total.protein  += getNutrient(best.food, ["protein"])             * multiplier;
+        total.fat      += getNutrient(best.food, ["total lipid", "fat"])  * multiplier;
+        total.carbs    += getNutrient(best.food, ["carbohydrate"])        * multiplier;
+        total.fiber    += getNutrient(best.food, ["fiber"])               * multiplier;
 
-        total.calories += getNutrient(best.food, ["energy"]) * multiplier;
-        total.protein += getNutrient(best.food, ["protein"]) * multiplier;
-        total.fat += getNutrient(best.food, ["total lipid", "fat"]) * multiplier;
-        total.carbs += getNutrient(best.food, ["carbohydrate"]) * multiplier;
-        total.fiber += getNutrient(best.food, ["fiber"]) * multiplier;
-
-        matched.push({
-          ingredient: ingredient.item,
-          matched: best.food.description || "USDA match",
-          dataType: best.food.dataType || "Unknown",
-          score: best.score,
-        });
+        matched.push({ ingredient: ingredient.item, matched: best.food.description || "USDA match", dataType: best.food.dataType || "Unknown", score: best.score, source: "usda" });
       }
 
+      // Step 3: Sanity cap
       const divisor = recipeForm.servings || 1;
-      setRecipeForm((current) => ({
-        ...current,
+      const rawCalTotal = total.calories;
+      const capHit = total.calories > MAX_RECIPE_CALORIES;
+      if (capHit) {
+        const scale = MAX_RECIPE_CALORIES / total.calories;
+        total.calories *= scale;
+        total.protein  *= scale;
+        total.fat      *= scale;
+        total.carbs    *= scale;
+        total.fiber    *= scale;
+      }
+
+      setRecipeForm((cur) => ({
+        ...cur,
         calories: Math.round(total.calories / divisor),
-        protein: Math.round(total.protein / divisor),
-        fat: Math.round(total.fat / divisor),
-        carbs: Math.round(total.carbs / divisor),
-        fiber: Math.round(total.fiber / divisor),
+        protein:  Math.round(total.protein  / divisor),
+        fat:      Math.round(total.fat      / divisor),
+        carbs:    Math.round(total.carbs    / divisor),
+        fiber:    Math.round(total.fiber    / divisor),
       }));
 
       setMatchLog(matched);
+      const capNote = capHit ? ` ⚠️ Raw estimate (${Math.round(rawCalTotal)} cal total) exceeded the sanity cap of ${MAX_RECIPE_CALORIES} cal and was scaled down — check your ingredient quantities.` : "";
       const missedText = missed.length ? ` Not matched: ${missed.join(", ")}.` : "";
-      setUsdaStatus(`USDA estimate complete. Matched ${matched.length} ingredient(s).${missedText} Review matched foods and macro values before saving.`);
+      setUsdaStatus(`Estimate complete. ${matched.length} ingredient(s) matched (local rules + USDA).${missedText}${capNote} Review before saving.`);
     } catch {
-      setUsdaStatus("USDA estimate failed. Check the API route and try again.");
+      setUsdaStatus("Estimate failed. Check the API route and try again.");
     } finally {
       setIsEstimating(false);
     }
   }
 
   function saveRecipe() {
-    const ingredients = ingredientsText.split("\n").map((line) => line.trim()).filter(Boolean).map(parseIngredientLine);
-    const recipeToSave: Recipe = { ...recipeForm, id: editingRecipeId ?? Date.now(), name: recipeForm.name.trim() || "Untitled Recipe", ingredients };
-    if (editingRecipeId) setRecipes((current) => current.map((recipe) => (recipe.id === editingRecipeId ? recipeToSave : recipe)));
-    else setRecipes((current) => [...current, recipeToSave]);
+    const ingredients = ingredientsText.split("\n").map((l) => l.trim()).filter(Boolean).map(parseIngredientLine);
+    const toSave: Recipe = { ...recipeForm, id: editingRecipeId ?? Date.now(), name: recipeForm.name.trim() || "Untitled Recipe", ingredients };
+
+    if (editingRecipeId) setRecipes((cur) => cur.map((r) => (r.id === editingRecipeId ? toSave : r)));
+    else setRecipes((cur) => [...cur, toSave]);
+
     setEditingRecipeId(null);
     setRecipeForm(blankRecipe());
     setIngredientsText("1 lb chicken breast\n8 each tortillas\n1 cup salsa");
@@ -302,27 +456,22 @@ export default function Home() {
   function editRecipe(recipe: Recipe) {
     setEditingRecipeId(recipe.id);
     setRecipeForm(recipe);
-    setIngredientsText(recipe.ingredients.map((ingredient) => `${ingredient.qty} ${ingredient.unit} ${ingredient.item}`).join("\n"));
+    setIngredientsText(recipe.ingredients.map((i) => `${i.qty} ${i.unit} ${i.item}`).join("\n"));
     setMatchLog([]);
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   function deleteRecipe(id: number) {
-    setRecipes((current) => current.filter((recipe) => recipe.id !== id));
-    setMealPlan((current) => {
-      const next = { ...current };
+    setRecipes((cur) => cur.filter((r) => r.id !== id));
+    setMealPlan((cur) => {
+      const next = { ...cur };
       days.forEach((day) => {
         next[day] = { ...next[day] };
-        mealSlots.forEach((slot) => {
-          if (next[day][slot] === id) next[day][slot] = "";
-        });
+        mealSlots.forEach((slot) => { if (next[day][slot] === id) next[day][slot] = ""; });
       });
       return next;
     });
-    if (editingRecipeId === id) {
-      setEditingRecipeId(null);
-      setRecipeForm(blankRecipe());
-    }
+    if (editingRecipeId === id) { setEditingRecipeId(null); setRecipeForm(blankRecipe()); }
   }
 
   function cancelEdit() {
@@ -333,29 +482,30 @@ export default function Home() {
   }
 
   function updateMealPlan(day: string, slot: MealSlot, recipeId: string) {
-    setMealPlan((current) => ({ ...current, [day]: { ...current[day], [slot]: recipeId ? Number(recipeId) : "" } }));
+    setMealPlan((cur) => ({ ...cur, [day]: { ...cur[day], [slot]: recipeId ? Number(recipeId) : "" } }));
   }
 
-  function clearMealPlan() {
-    setMealPlan(createEmptyMealPlan());
-  }
+  function clearMealPlan() { setMealPlan(createEmptyMealPlan()); }
 
-  const plannedRecipeIds = useMemo(() => days.flatMap((day) => mealSlots.map((slot) => mealPlan[day]?.[slot])).filter(Boolean) as number[], [mealPlan]);
+  const plannedRecipeIds = useMemo(
+    () => days.flatMap((day) => mealSlots.map((slot) => mealPlan[day]?.[slot])).filter(Boolean) as number[],
+    [mealPlan]
+  );
   const plannedMealCount = plannedRecipeIds.length;
 
   const weeklyMacroTotals = useMemo(() => {
     return plannedRecipeIds.reduce(
       (totals, recipeId) => {
-        const recipe = recipes.find((item) => item.id === recipeId);
+        const recipe = recipes.find((r) => r.id === recipeId);
         if (!recipe) return totals;
-        const target = family.reduce((sum, person) => sum + (scaleBy === "protein" ? person.mealProtein : person.mealCalories), 0);
+        const target = family.reduce((sum, p) => sum + (scaleBy === "protein" ? p.mealProtein : p.mealCalories), 0);
         const recipeTarget = scaleBy === "protein" ? recipe.protein : recipe.calories;
         const servingsNeeded = recipeTarget > 0 ? target / recipeTarget : family.length;
         totals.calories += recipe.calories * servingsNeeded;
-        totals.protein += recipe.protein * servingsNeeded;
-        totals.fat += recipe.fat * servingsNeeded;
-        totals.carbs += recipe.carbs * servingsNeeded;
-        totals.fiber += recipe.fiber * servingsNeeded;
+        totals.protein  += recipe.protein  * servingsNeeded;
+        totals.fat      += recipe.fat      * servingsNeeded;
+        totals.carbs    += recipe.carbs    * servingsNeeded;
+        totals.fiber    += recipe.fiber    * servingsNeeded;
         return totals;
       },
       { calories: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 }
@@ -363,10 +513,10 @@ export default function Home() {
   }, [plannedRecipeIds, recipes, family, scaleBy]);
 
   const groceryList = useMemo(() => {
-    const target = family.reduce((sum, person) => sum + (scaleBy === "protein" ? person.mealProtein : person.mealCalories), 0);
+    const target = family.reduce((sum, p) => sum + (scaleBy === "protein" ? p.mealProtein : p.mealCalories), 0);
     const list: Record<string, { qty: number; unit: string; section: string }> = {};
     plannedRecipeIds.forEach((recipeId) => {
-      const recipe = recipes.find((item) => item.id === recipeId);
+      const recipe = recipes.find((r) => r.id === recipeId);
       if (!recipe) return;
       const recipeTarget = scaleBy === "protein" ? recipe.protein : recipe.calories;
       const servingsNeeded = recipeTarget > 0 ? target / recipeTarget : family.length;
@@ -385,39 +535,211 @@ export default function Home() {
       <div className="mx-auto max-w-7xl space-y-6">
         <h1 className="text-3xl font-bold md:text-4xl">Recipe Macro Grocery Planner</h1>
 
+        {/* Family Targets */}
         <section className="rounded-2xl bg-white p-4 shadow md:p-6">
           <h2 className="mb-4 text-2xl font-semibold">Family Meal Targets</h2>
           <div className="overflow-x-auto">
             <table className="w-full min-w-[720px] border text-sm">
-              <thead className="bg-slate-200"><tr><th className="border p-2">Name</th><th className="border p-2">Meal Calories</th><th className="border p-2">Meal Protein</th><th className="border p-2">Meal Fat</th><th className="border p-2">Meal Carbs</th><th className="border p-2">Meal Fiber</th></tr></thead>
-              <tbody>{family.map((person) => (<tr key={person.id}><td className="border p-2"><input className="w-28 rounded border p-1" value={person.name} onChange={(e) => updateFamily(person.id, "name", e.target.value)} /></td>{(["mealCalories", "mealProtein", "mealFat", "mealCarbs", "mealFiber"] as const).map((field) => (<td key={field} className="border p-2"><input className="w-20 rounded border p-1" type="number" value={person[field]} onChange={(e) => updateFamily(person.id, field, e.target.value)} /></td>))}</tr>))}</tbody>
+              <thead className="bg-slate-200">
+                <tr>
+                  <th className="border p-2">Name</th>
+                  <th className="border p-2">Meal Calories</th>
+                  <th className="border p-2">Meal Protein</th>
+                  <th className="border p-2">Meal Fat</th>
+                  <th className="border p-2">Meal Carbs</th>
+                  <th className="border p-2">Meal Fiber</th>
+                </tr>
+              </thead>
+              <tbody>
+                {family.map((person) => (
+                  <tr key={person.id}>
+                    <td className="border p-2">
+                      <input className="w-28 rounded border p-1" value={person.name} onChange={(e) => updateFamily(person.id, "name", e.target.value)} />
+                    </td>
+                    {(["mealCalories", "mealProtein", "mealFat", "mealCarbs", "mealFiber"] as const).map((field) => (
+                      <td key={field} className="border p-2">
+                        <input className="w-20 rounded border p-1" type="number" value={person[field]} onChange={(e) => updateFamily(person.id, field, e.target.value)} />
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
             </table>
           </div>
         </section>
 
+        {/* Add / Edit Recipe */}
         <section className="rounded-2xl bg-white p-4 shadow md:p-6">
           <h2 className="mb-4 text-2xl font-semibold">{editingRecipeId ? "Edit Recipe" : "Add Recipe"}</h2>
           <div className="grid gap-4 md:grid-cols-2">
-            <label className="block"><span className="mb-1 block text-sm font-medium">Recipe Name</span><input className="w-full rounded border p-2" value={recipeForm.name} onChange={(e) => updateRecipeField("name", e.target.value)} /></label>
-            <label className="block"><span className="mb-1 block text-sm font-medium">Category</span><select className="w-full rounded border p-2" value={recipeForm.category} onChange={(e) => updateRecipeField("category", e.target.value)}><option>Breakfast</option><option>Lunch</option><option>Dinner</option><option>Snack</option><option>Dessert</option></select></label>
-            <label className="block md:col-span-2"><span className="mb-1 block text-sm font-medium">Tags</span><input className="w-full rounded border p-2" value={recipeForm.tags} onChange={(e) => updateRecipeField("tags", e.target.value)} placeholder="high protein, quick, kid friendly" /></label>
-            {(["servings", "calories", "protein", "fat", "carbs", "fiber"] as const).map((field) => (<label key={field} className="block"><span className="mb-1 block text-sm font-medium">{field === "servings" ? "Servings" : `${field.charAt(0).toUpperCase() + field.slice(1)} Per Serving`}</span><input className="w-full rounded border p-2" type="number" value={recipeForm[field]} onChange={(e) => updateRecipeField(field, e.target.value)} /></label>))}
-            <label className="block md:col-span-2"><span className="mb-1 block text-sm font-medium">Ingredients</span><textarea className="min-h-32 w-full rounded border p-2" value={ingredientsText} onChange={(e) => setIngredientsText(e.target.value)} placeholder="One ingredient per line, example: 1 lb chicken breast" /></label>
+            <label className="block">
+              <span className="mb-1 block text-sm font-medium">Recipe Name</span>
+              <input className="w-full rounded border p-2" value={recipeForm.name} onChange={(e) => updateRecipeField("name", e.target.value)} />
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-sm font-medium">Category</span>
+              <select className="w-full rounded border p-2" value={recipeForm.category} onChange={(e) => updateRecipeField("category", e.target.value)}>
+                <option>Breakfast</option><option>Lunch</option><option>Dinner</option><option>Snack</option><option>Dessert</option>
+              </select>
+            </label>
+            <label className="block md:col-span-2">
+              <span className="mb-1 block text-sm font-medium">Tags</span>
+              <input className="w-full rounded border p-2" value={recipeForm.tags} onChange={(e) => updateRecipeField("tags", e.target.value)} placeholder="high protein, quick, kid friendly" />
+            </label>
+            {(["servings", "calories", "protein", "fat", "carbs", "fiber"] as const).map((field) => (
+              <label key={field} className="block">
+                <span className="mb-1 block text-sm font-medium">{field === "servings" ? "Servings" : `${field.charAt(0).toUpperCase() + field.slice(1)} Per Serving`}</span>
+                <input className="w-full rounded border p-2" type="number" value={recipeForm[field]} onChange={(e) => updateRecipeField(field, e.target.value)} />
+              </label>
+            ))}
+            <label className="block md:col-span-2">
+              <span className="mb-1 block text-sm font-medium">Ingredients (one per line, e.g. "1 lb chicken breast")</span>
+              <textarea className="min-h-32 w-full rounded border p-2" value={ingredientsText} onChange={(e) => setIngredientsText(e.target.value)} />
+            </label>
+
             <p className="text-sm text-slate-600 md:col-span-2">{usdaStatus}</p>
-            {matchLog.length > 0 && (<div className="rounded bg-slate-50 p-3 text-sm md:col-span-2"><div className="mb-2 font-semibold">USDA Matches Used</div>{matchLog.map((match) => (<div key={`${match.ingredient}-${match.matched}`} className="border-b py-1 last:border-b-0"><span className="font-medium">{match.ingredient}</span> → {match.matched} <span className="text-slate-500">({match.dataType}, score {match.score})</span></div>))}</div>)}
-            <div className="flex flex-wrap gap-3 md:col-span-2"><button onClick={estimateNutritionFromUsda} disabled={isEstimating} className="rounded bg-green-600 px-4 py-2 text-white disabled:bg-slate-400">{isEstimating ? "Estimating..." : "Estimate Nutrition from USDA"}</button><button onClick={saveRecipe} className="rounded bg-blue-600 px-4 py-2 text-white">{editingRecipeId ? "Update Recipe" : "Save Recipe"}</button>{editingRecipeId && (<button onClick={cancelEdit} className="rounded border px-4 py-2">Cancel Edit</button>)}</div>
+
+            {matchLog.length > 0 && (
+              <div className="rounded bg-slate-50 p-3 text-sm md:col-span-2">
+                <div className="mb-2 font-semibold">Nutrition Sources Used</div>
+                {matchLog.map((m) => (
+                  <div key={`${m.ingredient}-${m.matched}`} className="border-b py-1 last:border-b-0 flex items-start gap-2">
+                    <span className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-xs font-semibold ${m.source === "local" ? "bg-emerald-100 text-emerald-800" : "bg-blue-100 text-blue-800"}`}>
+                      {m.source === "local" ? "LOCAL" : "USDA"}
+                    </span>
+                    <span>
+                      <span className="font-medium">{m.ingredient}</span> → {m.matched}
+                      {m.source === "usda" && <span className="text-slate-500"> ({m.dataType}, score {m.score})</span>}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-3 md:col-span-2">
+              <button onClick={estimateNutritionFromUsda} disabled={isEstimating} className="rounded bg-green-600 px-4 py-2 text-white disabled:bg-slate-400">
+                {isEstimating ? "Estimating..." : "Estimate Nutrition"}
+              </button>
+              <button onClick={saveRecipe} className="rounded bg-blue-600 px-4 py-2 text-white">
+                {editingRecipeId ? "Update Recipe" : "Save Recipe"}
+              </button>
+              {editingRecipeId && (
+                <button onClick={cancelEdit} className="rounded border px-4 py-2">Cancel Edit</button>
+              )}
+            </div>
           </div>
         </section>
 
+        {/* Weekly Planner */}
         <section className="rounded-2xl bg-white p-4 shadow md:p-6">
-          <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between"><h2 className="text-2xl font-semibold">Weekly Meal Planner</h2><div className="flex flex-wrap items-center gap-3"><label className="text-sm font-medium">Scale grocery list by<select className="ml-2 rounded border p-2" value={scaleBy} onChange={(e) => setScaleBy(e.target.value as "calories" | "protein")}><option value="calories">Calories</option><option value="protein">Protein</option></select></label><button onClick={clearMealPlan} className="rounded border px-3 py-2 text-sm">Clear Week</button></div></div>
-          <div className="overflow-x-auto"><table className="w-full min-w-[900px] border text-sm"><thead className="bg-slate-200"><tr><th className="border p-2">Day</th>{mealSlots.map((slot) => (<th key={slot} className="border p-2">{slot}</th>))}</tr></thead><tbody>{days.map((day) => (<tr key={day}><td className="border p-2 font-semibold">{day}</td>{mealSlots.map((slot) => (<td key={slot} className="border p-2"><select className="w-full rounded border p-2" value={mealPlan[day]?.[slot] || ""} onChange={(e) => updateMealPlan(day, slot, e.target.value)}><option value="">No meal</option>{recipes.filter((recipe) => slot === "Snack" || recipe.category === slot || recipe.category === "Dinner").map((recipe) => (<option key={recipe.id} value={recipe.id}>{recipe.name}</option>))}</select></td>))}</tr>))}</tbody></table></div>
-          <div className="mt-4 grid gap-3 md:grid-cols-5"><div className="rounded-xl bg-slate-100 p-3"><div className="text-xs text-slate-500">Planned Meals</div><div className="text-xl font-semibold">{plannedMealCount}</div></div><div className="rounded-xl bg-slate-100 p-3"><div className="text-xs text-slate-500">Calories</div><div className="text-xl font-semibold">{Math.round(weeklyMacroTotals.calories)}</div></div><div className="rounded-xl bg-slate-100 p-3"><div className="text-xs text-slate-500">Protein</div><div className="text-xl font-semibold">{Math.round(weeklyMacroTotals.protein)}g</div></div><div className="rounded-xl bg-slate-100 p-3"><div className="text-xs text-slate-500">Carbs</div><div className="text-xl font-semibold">{Math.round(weeklyMacroTotals.carbs)}g</div></div><div className="rounded-xl bg-slate-100 p-3"><div className="text-xs text-slate-500">Fat / Fiber</div><div className="text-xl font-semibold">{Math.round(weeklyMacroTotals.fat)}g / {Math.round(weeklyMacroTotals.fiber)}g</div></div></div>
+          <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <h2 className="text-2xl font-semibold">Weekly Meal Planner</h2>
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="text-sm font-medium">
+                Scale grocery list by
+                <select className="ml-2 rounded border p-2" value={scaleBy} onChange={(e) => setScaleBy(e.target.value as "calories" | "protein")}>
+                  <option value="calories">Calories</option>
+                  <option value="protein">Protein</option>
+                </select>
+              </label>
+              <button onClick={clearMealPlan} className="rounded border px-3 py-2 text-sm">Clear Week</button>
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[900px] border text-sm">
+              <thead className="bg-slate-200">
+                <tr>
+                  <th className="border p-2">Day</th>
+                  {mealSlots.map((slot) => <th key={slot} className="border p-2">{slot}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {days.map((day) => (
+                  <tr key={day}>
+                    <td className="border p-2 font-semibold">{day}</td>
+                    {mealSlots.map((slot) => (
+                      <td key={slot} className="border p-2">
+                        <select className="w-full rounded border p-2" value={mealPlan[day]?.[slot] || ""} onChange={(e) => updateMealPlan(day, slot, e.target.value)}>
+                          <option value="">No meal</option>
+                          {recipes.filter((r) => slot === "Snack" || r.category === slot || r.category === "Dinner").map((r) => (
+                            <option key={r.id} value={r.id}>{r.name}</option>
+                          ))}
+                        </select>
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-5">
+            {[
+              { label: "Planned Meals", value: plannedMealCount,                        unit: ""  },
+              { label: "Calories",      value: Math.round(weeklyMacroTotals.calories),  unit: ""  },
+              { label: "Protein",       value: Math.round(weeklyMacroTotals.protein),   unit: "g" },
+              { label: "Carbs",         value: Math.round(weeklyMacroTotals.carbs),     unit: "g" },
+              { label: "Fat / Fiber",   value: `${Math.round(weeklyMacroTotals.fat)}g / ${Math.round(weeklyMacroTotals.fiber)}g`, unit: "" },
+            ].map(({ label, value, unit }) => (
+              <div key={label} className="rounded-xl bg-slate-100 p-3">
+                <div className="text-xs text-slate-500">{label}</div>
+                <div className="text-xl font-semibold">{value}{unit}</div>
+              </div>
+            ))}
+          </div>
         </section>
 
-        <section className="rounded-2xl bg-white p-4 shadow md:p-6"><h2 className="mb-4 text-2xl font-semibold">Saved Recipes</h2><div className="space-y-3">{recipes.map((recipe) => (<div key={recipe.id} className="rounded border p-3"><div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between"><div><div className="font-semibold">{recipe.name}</div><div className="text-sm text-slate-600">{recipe.category} {recipe.tags ? `• ${recipe.tags}` : ""}</div><div className="text-sm text-slate-600">{recipe.servings} servings | {recipe.calories} cal | {recipe.protein}g protein | {recipe.fat}g fat | {recipe.carbs}g carbs | {recipe.fiber}g fiber</div></div><div className="flex gap-2"><button onClick={() => editRecipe(recipe)} className="rounded border px-3 py-2 text-sm">Edit</button><button onClick={() => deleteRecipe(recipe.id)} className="rounded bg-red-600 px-3 py-2 text-sm text-white">Delete</button></div></div></div>))}</div></section>
+        {/* Saved Recipes */}
+        <section className="rounded-2xl bg-white p-4 shadow md:p-6">
+          <h2 className="mb-4 text-2xl font-semibold">Saved Recipes</h2>
+          <div className="space-y-3">
+            {recipes.map((recipe) => (
+              <div key={recipe.id} className="rounded border p-3">
+                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                  <div>
+                    <div className="font-semibold">{recipe.name}</div>
+                    <div className="text-sm text-slate-600">{recipe.category}{recipe.tags ? ` • ${recipe.tags}` : ""}</div>
+                    <div className="text-sm text-slate-600">
+                      {recipe.servings} servings | {recipe.calories} cal | {recipe.protein}g protein | {recipe.fat}g fat | {recipe.carbs}g carbs | {recipe.fiber}g fiber
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button onClick={() => editRecipe(recipe)} className="rounded border px-3 py-2 text-sm">Edit</button>
+                    <button onClick={() => deleteRecipe(recipe.id)} className="rounded bg-red-600 px-3 py-2 text-sm text-white">Delete</button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
 
-        <section className="rounded-2xl bg-white p-4 shadow md:p-6"><h2 className="mb-1 text-2xl font-semibold">Grocery List For This Week</h2><p className="mb-4 text-sm text-slate-600">Only recipes assigned in the weekly meal planner are included.</p>{plannedMealCount === 0 ? (<div className="rounded border border-dashed p-4 text-slate-500">Add recipes to the weekly meal planner to generate a grocery list.</div>) : (<div className="space-y-4">{grocerySections.map((section) => { const items = groceryList.filter((item) => item.section === section); if (items.length === 0) return null; return (<div key={section}><h3 className="mb-2 font-semibold text-slate-700">{section}</h3><div className="space-y-2">{items.map((data) => (<div key={`${data.item}-${data.unit}`} className="flex justify-between border-b py-2 text-sm md:text-base"><span className="capitalize">{data.item}</span><span>{data.qty.toFixed(2)} {data.unit}</span></div>))}</div></div>); })}</div>)}</section>
+        {/* Grocery List */}
+        <section className="rounded-2xl bg-white p-4 shadow md:p-6">
+          <h2 className="mb-1 text-2xl font-semibold">Grocery List For This Week</h2>
+          <p className="mb-4 text-sm text-slate-600">Only recipes assigned in the weekly meal planner are included.</p>
+          {plannedMealCount === 0 ? (
+            <div className="rounded border border-dashed p-4 text-slate-500">Add recipes to the weekly meal planner to generate a grocery list.</div>
+          ) : (
+            <div className="space-y-4">
+              {grocerySections.map((section) => {
+                const items = groceryList.filter((i) => i.section === section);
+                if (items.length === 0) return null;
+                return (
+                  <div key={section}>
+                    <h3 className="mb-2 font-semibold text-slate-700">{section}</h3>
+                    <div className="space-y-2">
+                      {items.map((data) => (
+                        <div key={`${data.item}-${data.unit}`} className="flex justify-between border-b py-2 text-sm md:text-base">
+                          <span className="capitalize">{data.item}</span>
+                          <span>{data.qty.toFixed(2)} {data.unit}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
       </div>
     </main>
   );
