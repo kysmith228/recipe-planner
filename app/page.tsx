@@ -319,7 +319,7 @@ export default function Home() {
     const parsed = JSON.parse(raw);
     const loadedFamily: FamilyMember[] = (parsed.family || defaultFamily).map((p: FamilyMember) => ({ ...p, enabledSlots: p.enabledSlots || allMealSlots }));
     setFamily(loadedFamily);
-    setRecipes((parsed.recipes || []).map((r: Recipe) => ({ notes: "", ...r })));
+    setRecipes((parsed.recipes || []).map((r: Recipe) => ({ ...r, notes: r.notes ?? "" })));
     setScaleBy(parsed.scaleBy || "calories");
     if (parsed.personMealPlan) {
       const migrated: PersonMealPlan = {};
