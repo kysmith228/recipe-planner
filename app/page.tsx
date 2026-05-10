@@ -1,30 +1,26 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 type FamilyMember = {
-  id: number;
-  name: string;
-  mealCalories: number;
-  mealProtein: number;
-  mealFat: number;
-  mealCarbs: number;
-  mealFiber: number;
+  id: number; name: string;
+  mealCalories: number; mealProtein: number; mealFat: number; mealCarbs: number; mealFiber: number;
   enabledSlots: MealSlot[];
 };
 type Ingredient = { item: string; qty: number; unit: string; section: string };
 type Recipe = {
-  id: number; name: string; category: string; tags: string;
+  id: number; name: string; category: string; tags: string; notes: string;
   servings: number; calories: number; protein: number; fat: number; carbs: number; fiber: number;
   ingredients: Ingredient[];
 };
 type MealSlot = "Breakfast" | "Lunch" | "Dinner" | "Snack";
-type MealEntry = { main: number | ""; sides: number[] };
+type MealEntry = { main: number | ""; sides: number[]; servingOverride?: number };
 function emptyMealEntry(): MealEntry { return { main: "", sides: [] }; }
 type PersonMealPlan = Record<number, Record<string, Record<MealSlot, MealEntry>>>;
+type WeekTemplate = { id: number; name: string; plan: PersonMealPlan };
 type UsdaFoodNutrient = { nutrientName?: string; value?: number };
 type UsdaFood = { description?: string; dataType?: string; brandOwner?: string; foodNutrients?: UsdaFoodNutrient[] };
 type MatchLog = { ingredient: string; matched: string; dataType: string; score: number; source: "local" | "usda" };
@@ -54,8 +50,8 @@ const localNutritionRules: { pattern: RegExp; label: string; nutrition: LocalNut
   { pattern: /maple syrup/i,              label: "Maple Syrup",               nutrition: { cal: 260, protein: 0,   fat: 0.1, carbs: 67,  fiber: 0   } },
   { pattern: /ketchup/i,                  label: "Ketchup",                   nutrition: { cal: 100, protein: 1.7, fat: 0.1, carbs: 27,  fiber: 0.3 } },
   { pattern: /mayo|mayonnaise/i,          label: "Mayonnaise",                nutrition: { cal: 680, protein: 1,   fat: 75,  carbs: 0.6, fiber: 0   } },
-  { pattern: /^salt$|kosher salt|sea salt|table salt/i, label: "Salt (negligible)",    nutrition: { cal: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 } },
-  { pattern: /black pepper|white pepper|^pepper$/i,     label: "Pepper (negligible)",  nutrition: { cal: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 } },
+  { pattern: /^salt$|kosher salt|sea salt|table salt/i, label: "Salt (negligible)",     nutrition: { cal: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 } },
+  { pattern: /black pepper|white pepper|^pepper$/i,     label: "Pepper (negligible)",   nutrition: { cal: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 } },
   { pattern: /^garlic powder$/i,          label: "Garlic Powder (negligible)", nutrition: { cal: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 } },
   { pattern: /^onion powder$/i,           label: "Onion Powder (negligible)",  nutrition: { cal: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 } },
   { pattern: /cumin|paprika|oregano|basil|thyme|rosemary|chili powder|cayenne|cinnamon|nutmeg|turmeric|coriander|seasoning|spice mix|italian seasoning|taco seasoning/i,
@@ -63,8 +59,8 @@ const localNutritionRules: { pattern: RegExp; label: string; nutrition: LocalNut
 ];
 
 const MAX_RECIPE_CALORIES = 6000;
-const STORAGE_KEY = "recipe-planner-v5-ux";
-const OLD_STORAGE_KEYS = ["recipe-planner-v4-sides","recipe-planner-v3-per-person","recipe-planner-phase-2-alias-normalized-v1"];
+const STORAGE_KEY = "recipe-planner-v6-full";
+const OLD_STORAGE_KEYS = ["recipe-planner-v5-ux","recipe-planner-v4-sides","recipe-planner-v3-per-person","recipe-planner-phase-2-alias-normalized-v1"];
 const days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
 const allMealSlots: MealSlot[] = ["Breakfast","Lunch","Dinner","Snack"];
 const ALL_CATEGORIES = ["Breakfast","Lunch","Dinner","Snack","Side","Dressing","Dessert"];
@@ -154,11 +150,10 @@ function parseIngredientLine(line: string): Ingredient {
   if (parts.length >= 3 && parts[1]?.includes("/")) { qty = parseAmount(`${parts[0]} ${parts[1]}`); unitIndex = 2; }
   const unit = parts[unitIndex] || "each";
   const rawItem = parts.slice(unitIndex + 1).join(" ") || cleaned;
-  const item = normalizeIngredientName(rawItem);
-  return { qty, unit, item, section: sectionForItem(item) };
+  return { qty, unit, item: normalizeIngredientName(rawItem), section: sectionForItem(rawItem) };
 }
 function blankRecipe(): Recipe {
-  return { id: 0, name: "", category: "Dinner", tags: "", servings: 4, calories: 500, protein: 35, fat: 15, carbs: 45, fiber: 5, ingredients: [] };
+  return { id: 0, name: "", category: "Dinner", tags: "", notes: "", servings: 4, calories: 500, protein: 35, fat: 15, carbs: 45, fiber: 5, ingredients: [] };
 }
 function getNutrient(food: UsdaFood, names: string[]) {
   const n = food.foodNutrients?.find((x) => names.some((name) => (x.nutrientName || "").toLowerCase().includes(name)));
@@ -222,66 +217,64 @@ function accumulateIngredients(recipe: Recipe, servingsNeeded: number, list: Rec
     list[key].qty += ing.qty * scale;
   });
 }
-
-// ── FEATURE 3: Human-friendly quantity formatting ──
 function formatQty(qty: number, unit: string): string {
   const u = unit.toLowerCase();
-  // Convert small oz amounts to tsp/tbsp
   if (["oz","ounce","ounces"].includes(u)) {
     if (qty < 0.5) return `${+(qty * 6).toFixed(1)} tsp`;
     if (qty < 1)   return `${+(qty * 2).toFixed(1)} tbsp`;
   }
-  // Convert large tsp to tbsp
-  if (["tsp","teaspoon","teaspoons"].includes(u) && qty >= 3) {
-    return `${+(qty / 3).toFixed(1)} tbsp`;
-  }
-  // Convert large tbsp to cups
-  if (["tbsp","tablespoon","tablespoons"].includes(u) && qty >= 16) {
-    return `${+(qty / 16).toFixed(2)} cups`;
-  }
-  // Round to nearest sensible fraction
-  if (qty >= 10)  return `${Math.round(qty)} ${unit}`;
-  if (qty >= 1)   return `${+(Math.round(qty * 4) / 4).toFixed(2).replace(/\.?0+$/, "")} ${unit}`;
-  // Show fractions for small amounts
+  if (["tsp","teaspoon","teaspoons"].includes(u) && qty >= 3) return `${+(qty / 3).toFixed(1)} tbsp`;
+  if (["tbsp","tablespoon","tablespoons"].includes(u) && qty >= 16) return `${+(qty / 16).toFixed(2)} cups`;
+  if (qty >= 10) return `${Math.round(qty)} ${unit}`;
+  if (qty >= 1)  return `${+(Math.round(qty * 4) / 4).toFixed(2).replace(/\.?0+$/, "")} ${unit}`;
   const fracs: [number, string][] = [[0.125,"⅛"],[0.25,"¼"],[0.333,"⅓"],[0.5,"½"],[0.667,"⅔"],[0.75,"¾"]];
   const closest = fracs.reduce((a, b) => Math.abs(b[0] - qty) < Math.abs(a[0] - qty) ? b : a);
   if (Math.abs(closest[0] - qty) < 0.05) return `${closest[1]} ${unit}`;
   return `${qty.toFixed(2)} ${unit}`;
 }
-
-// ── FEATURE 1: Macro feedback color for a slot ──
 function slotMacroColor(entry: MealEntry, person: FamilyMember, recipes: Recipe[], scaleBy: "calories" | "protein"): string {
-  const ids = entryRecipeIds(entry);
-  if (!ids.length) return "";
+  const ids = entryRecipeIds(entry); if (!ids.length) return "";
   const target = scaleBy === "protein" ? person.mealProtein : person.mealCalories;
   let total = 0;
   ids.forEach((rid) => {
-    const r = recipes.find((x) => x.id === rid);
-    if (!r) return;
+    const r = recipes.find((x) => x.id === rid); if (!r) return;
     const rt = scaleBy === "protein" ? r.protein : r.calories;
-    total += rt > 0 ? (target / rt) * (scaleBy === "protein" ? r.protein : r.calories) : 0;
+    const servings = entry.servingOverride ?? (rt > 0 ? target / rt : 1);
+    total += (scaleBy === "protein" ? r.protein : r.calories) * servings;
   });
   const pct = target > 0 ? total / target : 0;
-  if (pct < 0.7) return "bg-blue-50 border-blue-200";      // under
-  if (pct <= 1.15) return "bg-green-50 border-green-200";  // on target
-  return "bg-red-50 border-red-200";                        // over
+  if (pct < 0.7) return "bg-blue-50 border-blue-200";
+  if (pct <= 1.15) return "bg-green-50 border-green-200";
+  return "bg-red-50 border-red-200";
 }
-
-// ── FEATURE 1: Macro summary text for a slot ──
 function slotMacroSummary(entry: MealEntry, person: FamilyMember, recipes: Recipe[], scaleBy: "calories" | "protein"): string {
-  const ids = entryRecipeIds(entry);
-  if (!ids.length) return "";
+  const ids = entryRecipeIds(entry); if (!ids.length) return "";
   const target = scaleBy === "protein" ? person.mealProtein : person.mealCalories;
   let cal = 0; let pro = 0;
   ids.forEach((rid) => {
-    const r = recipes.find((x) => x.id === rid);
-    if (!r) return;
+    const r = recipes.find((x) => x.id === rid); if (!r) return;
     const rt = scaleBy === "protein" ? r.protein : r.calories;
-    const servings = rt > 0 ? target / rt : 1;
-    cal += r.calories * servings;
-    pro += r.protein  * servings;
+    const servings = entry.servingOverride ?? (rt > 0 ? target / rt : 1);
+    cal += r.calories * servings; pro += r.protein * servings;
   });
   return `${Math.round(cal)} cal · ${Math.round(pro)}g pro`;
+}
+
+// Progress bar component
+function MacroBar({ label, value, target, color }: { label: string; value: number; target: number; color: string }) {
+  const pct = Math.min(100, target > 0 ? (value / target) * 100 : 0);
+  const over = target > 0 && value > target * 1.1;
+  return (
+    <div className="space-y-1">
+      <div className="flex justify-between text-xs">
+        <span className="font-medium text-slate-600">{label}</span>
+        <span className={over ? "text-red-600 font-semibold" : "text-slate-500"}>{Math.round(value)} / {Math.round(target)}</span>
+      </div>
+      <div className="h-2 rounded-full bg-slate-200 overflow-hidden">
+        <div className={`h-full rounded-full transition-all ${over ? "bg-red-500" : color}`} style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -301,14 +294,23 @@ export default function Home() {
   const [isEstimating, setIsEstimating] = useState(false);
   const [matchLog, setMatchLog] = useState<MatchLog[]>([]);
   const [expandedSlot, setExpandedSlot] = useState<string | null>(null);
-  // Feature 2: recipe search/filter
   const [recipeSearch, setRecipeSearch] = useState("");
   const [recipeCatFilter, setRecipeCatFilter] = useState("All");
-  // Feature 6: delete confirm
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
-  // Feature 7: copy week modal
   const [copyFromId, setCopyFromId] = useState<number | null>(null);
   const [copyToId, setCopyToId] = useState<number | null>(null);
+  // New state
+  const [checkedItems, setCheckedItems] = useState<Set<string>>(new Set());
+  const [weekTemplates, setWeekTemplates] = useState<WeekTemplate[]>([]);
+  const [showSaveTemplate, setShowSaveTemplate] = useState(false);
+  const [templateName, setTemplateName] = useState("");
+  const [showLoadTemplate, setShowLoadTemplate] = useState(false);
+  const [urlImportValue, setUrlImportValue] = useState("");
+  const [isImporting, setIsImporting] = useState(false);
+  const [importStatus, setImportStatus] = useState("");
+  const [expandedNotes, setExpandedNotes] = useState<number | null>(null);
+  const [mobileDay, setMobileDay] = useState(days[0]);
+  const importRef = useRef<HTMLInputElement>(null);
 
   // Load
   useEffect(() => {
@@ -317,22 +319,21 @@ export default function Home() {
     const parsed = JSON.parse(raw);
     const loadedFamily: FamilyMember[] = (parsed.family || defaultFamily).map((p: FamilyMember) => ({ ...p, enabledSlots: p.enabledSlots || allMealSlots }));
     setFamily(loadedFamily);
-    setRecipes(parsed.recipes || []);
+    setRecipes((parsed.recipes || []).map((r: Recipe) => ({ notes: "", ...r })));
     setScaleBy(parsed.scaleBy || "calories");
     if (parsed.personMealPlan) {
       const migrated: PersonMealPlan = {};
       for (const [pid, plan] of Object.entries(parsed.personMealPlan))
         migrated[Number(pid)] = migratePlan(plan as Record<string, Record<MealSlot, number | "" | MealEntry>>);
       setPersonMealPlan(migrated);
-    } else {
-      setPersonMealPlan(createEmptyPersonMealPlan(loadedFamily));
-    }
+    } else { setPersonMealPlan(createEmptyPersonMealPlan(loadedFamily)); }
+    setWeekTemplates(parsed.weekTemplates || []);
     setActivePlanTab(loadedFamily[0]?.id ?? 1);
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ family, recipes, scaleBy, personMealPlan }));
-  }, [family, recipes, scaleBy, personMealPlan]);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ family, recipes, scaleBy, personMealPlan, weekTemplates }));
+  }, [family, recipes, scaleBy, personMealPlan, weekTemplates]);
 
   useEffect(() => {
     setPersonMealPlan((cur) => {
@@ -342,9 +343,7 @@ export default function Home() {
     });
   }, [family]);
 
-  // ---------------------------------------------------------------------------
   // Family
-  // ---------------------------------------------------------------------------
   function updateFamily(id: number, field: keyof FamilyMember, value: string) {
     setFamily((cur) => cur.map((p) => (p.id === id ? { ...p, [field]: field === "name" ? value : Number(value) } : p)));
   }
@@ -357,17 +356,68 @@ export default function Home() {
     }));
   }
 
-  // ---------------------------------------------------------------------------
   // Recipes
-  // ---------------------------------------------------------------------------
   function updateRecipeField(field: keyof Recipe, value: string) {
-    setRecipeForm((cur) => ({ ...cur, [field]: ["name","category","tags"].includes(field) ? value : Number(value) }));
+    setRecipeForm((cur) => ({ ...cur, [field]: ["name","category","tags","notes"].includes(field) ? value : Number(value) }));
+  }
+  function duplicateRecipe(recipe: Recipe) {
+    setRecipes((cur) => [...cur, { ...recipe, id: Date.now(), name: `${recipe.name} (copy)` }]);
   }
 
-  // Feature 5: duplicate recipe
-  function duplicateRecipe(recipe: Recipe) {
-    const copy: Recipe = { ...recipe, id: Date.now(), name: `${recipe.name} (copy)` };
-    setRecipes((cur) => [...cur, copy]);
+  // Feature: URL import via Claude API
+  async function importFromUrl() {
+    const url = urlImportValue.trim();
+    if (!url) return;
+    setIsImporting(true);
+    setImportStatus("Fetching recipe from URL...");
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1000,
+          messages: [{
+            role: "user",
+            content: `Visit this recipe URL and extract the recipe details: ${url}
+
+Return ONLY a JSON object with these exact fields (no markdown, no explanation):
+{
+  "name": "Recipe Name",
+  "category": "Dinner",
+  "tags": "tag1, tag2",
+  "notes": "Brief cooking instructions or notes",
+  "servings": 4,
+  "ingredients": ["1 lb chicken breast", "2 cups rice", "1 tsp salt"]
+}
+
+Category must be one of: Breakfast, Lunch, Dinner, Snack, Side, Dressing, Dessert.
+Ingredients must be plain strings like "1 lb chicken breast" — quantity, unit, then item.
+If you cannot access the URL, return {"error": "Could not fetch URL"}.`
+          }],
+        }),
+      });
+      const data = await response.json();
+      const text = data.content?.map((c: { type: string; text?: string }) => c.text || "").join("") || "";
+      const clean = text.replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(clean);
+      if (parsed.error) { setImportStatus(`Import failed: ${parsed.error}`); return; }
+      setRecipeForm({
+        ...blankRecipe(),
+        name: parsed.name || "",
+        category: ALL_CATEGORIES.includes(parsed.category) ? parsed.category : "Dinner",
+        tags: parsed.tags || "",
+        notes: parsed.notes || "",
+        servings: Number(parsed.servings) || 4,
+      });
+      setIngredientsText((parsed.ingredients || []).join("\n"));
+      setImportStatus(`✅ Imported "${parsed.name}" — review and click Estimate Nutrition, then Save Recipe.`);
+      setUrlImportValue("");
+      setActiveMainTab("recipes");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (e) {
+      setImportStatus(`Import failed: ${e instanceof Error ? e.message : "Unknown error"}`);
+    } finally { setIsImporting(false); }
   }
 
   async function estimateNutrition() {
@@ -415,7 +465,7 @@ export default function Home() {
       setMatchLog(matched);
       const capNote = capHit ? ` ⚠️ Raw total (${Math.round(rawCal)} cal) exceeded sanity cap and was scaled down.` : "";
       const missNote = missed.length ? ` Not matched: ${missed.join(", ")}.` : "";
-      setUsdaStatus(`Estimate complete. ${matched.length} matched.${missNote}${capNote} Review before saving.`);
+      setUsdaStatus(`Done. ${matched.length} matched.${missNote}${capNote} Review before saving.`);
     } catch { setUsdaStatus("Estimate failed. Check the API route."); }
     finally { setIsEstimating(false); }
   }
@@ -429,21 +479,17 @@ export default function Home() {
   }
   function editRecipe(recipe: Recipe) {
     setEditingRecipeId(recipe.id);
-    setRecipeForm(recipe);
+    setRecipeForm({ notes: "", ...recipe });
     setIngredientsText(recipe.ingredients.map((i) => `${i.qty} ${i.unit} ${i.item}`).join("\n"));
-    setMatchLog([]);
-    setActiveMainTab("recipes");
+    setMatchLog([]); setActiveMainTab("recipes");
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
-
-  // Feature 6: confirm delete if recipe is in use
   function requestDeleteRecipe(id: number) {
     const inUse = family.some((p) => {
       const plan = personMealPlan[p.id];
       return plan && days.some((day) => allMealSlots.some((slot) => entryRecipeIds(plan[day]?.[slot] ?? emptyMealEntry()).includes(id)));
     });
-    if (inUse) { setConfirmDeleteId(id); }
-    else confirmDeleteRecipe(id);
+    if (inUse) setConfirmDeleteId(id); else confirmDeleteRecipe(id);
   }
   function confirmDeleteRecipe(id: number) {
     setRecipes((cur) => cur.filter((r) => r.id !== id));
@@ -470,13 +516,11 @@ export default function Home() {
     setMatchLog([]);
   }
 
-  // ---------------------------------------------------------------------------
   // Meal plan
-  // ---------------------------------------------------------------------------
   function setMain(personId: number, day: string, slot: MealSlot, recipeId: string) {
     setPersonMealPlan((cur) => ({
-      ...cur,
-      [personId]: { ...cur[personId], [day]: { ...cur[personId]?.[day], [slot]: { ...cur[personId]?.[day]?.[slot], main: recipeId ? Number(recipeId) : "" } } },
+      ...cur, [personId]: { ...cur[personId], [day]: { ...cur[personId]?.[day],
+        [slot]: { ...cur[personId]?.[day]?.[slot], main: recipeId ? Number(recipeId) : "" } } },
     }));
   }
   function addSide(personId: number, day: string, slot: MealSlot, recipeId: number) {
@@ -492,32 +536,49 @@ export default function Home() {
       return { ...cur, [personId]: { ...cur[personId], [day]: { ...cur[personId]?.[day], [slot]: { ...entry, sides: entry.sides.filter((s) => s !== recipeId) } } } };
     });
   }
-  function clearPersonPlan(personId: number) {
-    setPersonMealPlan((cur) => ({ ...cur, [personId]: createEmptyPersonPlan() }));
+  // Feature: serving override per slot
+  function setServingOverride(personId: number, day: string, slot: MealSlot, value: string) {
+    setPersonMealPlan((cur) => {
+      const entry = cur[personId]?.[day]?.[slot] ?? emptyMealEntry();
+      return { ...cur, [personId]: { ...cur[personId], [day]: { ...cur[personId]?.[day],
+        [slot]: { ...entry, servingOverride: value ? Number(value) : undefined } } } };
+    });
   }
-
-  // Feature 7: copy week
+  function clearPersonPlan(personId: number) { setPersonMealPlan((cur) => ({ ...cur, [personId]: createEmptyPersonPlan() })); }
   function copyWeek() {
     if (!copyFromId || !copyToId || copyFromId === copyToId) return;
     setPersonMealPlan((cur) => {
-      const sourcePlan = cur[copyFromId];
-      if (!sourcePlan) return cur;
+      const src = cur[copyFromId]; if (!src) return cur;
       const copied: Record<string, Record<MealSlot, MealEntry>> = {};
       days.forEach((day) => {
         copied[day] = { Breakfast: emptyMealEntry(), Lunch: emptyMealEntry(), Dinner: emptyMealEntry(), Snack: emptyMealEntry() };
-        allMealSlots.forEach((slot) => {
-          const e = sourcePlan[day]?.[slot];
-          if (e) copied[day][slot] = { main: e.main, sides: [...e.sides] };
-        });
+        allMealSlots.forEach((slot) => { const e = src[day]?.[slot]; if (e) copied[day][slot] = { ...e, sides: [...e.sides] }; });
       });
       return { ...cur, [copyToId]: copied };
     });
     setCopyFromId(null); setCopyToId(null);
   }
 
-  // ---------------------------------------------------------------------------
-  // Derived data
-  // ---------------------------------------------------------------------------
+  // Templates
+  function saveTemplate() {
+    if (!templateName.trim()) return;
+    const t: WeekTemplate = { id: Date.now(), name: templateName.trim(), plan: JSON.parse(JSON.stringify(personMealPlan)) };
+    setWeekTemplates((cur) => [...cur, t]);
+    setTemplateName(""); setShowSaveTemplate(false);
+  }
+  function loadTemplate(t: WeekTemplate) {
+    setPersonMealPlan(JSON.parse(JSON.stringify(t.plan)));
+    setShowLoadTemplate(false);
+  }
+  function deleteTemplate(id: number) { setWeekTemplates((cur) => cur.filter((t) => t.id !== id)); }
+
+  // Grocery checkboxes
+  function toggleCheck(key: string) {
+    setCheckedItems((cur) => { const n = new Set(cur); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+  }
+  function clearChecks() { setCheckedItems(new Set()); }
+
+  // Derived
   function calcPersonWeeklyTotals(person: FamilyMember) {
     const t = { calories: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 };
     const plan = personMealPlan[person.id]; if (!plan) return t;
@@ -527,7 +588,7 @@ export default function Home() {
       entryRecipeIds(entry).forEach((rid) => {
         const r = recipes.find((x) => x.id === rid); if (!r) return;
         const rt = scaleBy === "protein" ? r.protein : r.calories;
-        const servings = rt > 0 ? target / rt : 1;
+        const servings = entry.servingOverride ?? (rt > 0 ? target / rt : 1);
         t.calories += r.calories * servings; t.protein += r.protein * servings;
         t.fat += r.fat * servings; t.carbs += r.carbs * servings; t.fiber += r.fiber * servings;
       });
@@ -545,7 +606,8 @@ export default function Home() {
         entryRecipeIds(entry).forEach((rid) => {
           const recipe = recipes.find((r) => r.id === rid); if (!recipe) return;
           const rt = scaleBy === "protein" ? recipe.protein : recipe.calories;
-          accumulateIngredients(recipe, rt > 0 ? target / rt : 1, list);
+          const servingsNeeded = entry.servingOverride ?? (rt > 0 ? target / rt : 1);
+          accumulateIngredients(recipe, servingsNeeded, list);
         });
       }));
     });
@@ -560,23 +622,19 @@ export default function Home() {
       return sum + days.reduce((ds, day) => ds + allMealSlots.filter((slot) => { const e = plan[day]?.[slot]; return e && (e.main || e.sides.length > 0); }).length, 0);
     }, 0), [family, personMealPlan]);
 
-  // Feature 2: filtered recipes
   const filteredRecipes = useMemo(() => recipes.filter((r) => {
-    const matchSearch = recipeSearch === "" || r.name.toLowerCase().includes(recipeSearch.toLowerCase()) || r.tags.toLowerCase().includes(recipeSearch.toLowerCase());
-    const matchCat = recipeCatFilter === "All" || r.category === recipeCatFilter;
-    return matchSearch && matchCat;
+    const ms = recipeSearch === "" || r.name.toLowerCase().includes(recipeSearch.toLowerCase()) || r.tags.toLowerCase().includes(recipeSearch.toLowerCase());
+    const mc = recipeCatFilter === "All" || r.category === recipeCatFilter;
+    return ms && mc;
   }), [recipes, recipeSearch, recipeCatFilter]);
 
-  // ---------------------------------------------------------------------------
-  // CSS helpers
-  // ---------------------------------------------------------------------------
   const activePerson = family.find((p) => p.id === activePlanTab) ?? family[0];
   const mainTabCls = (tab: typeof activeMainTab) =>
-    `px-4 py-2.5 text-sm font-medium rounded-t-lg border-b-2 transition-colors ${activeMainTab === tab ? "border-blue-600 text-blue-700 bg-white" : "border-transparent text-slate-500 hover:text-slate-700 bg-slate-100 hover:bg-slate-50"}`;
+    `px-3 py-2 text-xs sm:text-sm font-medium rounded-t-lg border-b-2 transition-colors whitespace-nowrap ${activeMainTab === tab ? "border-blue-600 text-blue-700 bg-white" : "border-transparent text-slate-500 hover:text-slate-700 bg-slate-100"}`;
   const personTabCls = (id: number) =>
-    `px-4 py-2 text-sm font-semibold rounded-t-lg border-b-2 transition-colors ${activePlanTab === id ? "border-blue-600 text-blue-700 bg-white" : "border-transparent text-slate-500 hover:text-slate-700 bg-slate-50 hover:bg-white"}`;
+    `px-3 py-2 text-sm font-semibold rounded-t-lg border-b-2 transition-colors ${activePlanTab === id ? "border-blue-600 text-blue-700 bg-white" : "border-transparent text-slate-500 bg-slate-50 hover:bg-white"}`;
 
-  // Planner cell component
+  // Planner cell
   function PlannerCell({ personId, day, slot, person }: { personId: number; day: string; slot: MealSlot; person: FamilyMember }) {
     const entry = personMealPlan[personId]?.[day]?.[slot] ?? emptyMealEntry();
     const slotKey = `${personId}-${day}-${slot}`;
@@ -585,9 +643,8 @@ export default function Home() {
     const sideOptions = recipes.filter((r) => r.id !== entry.main && !entry.sides.includes(r.id));
     const colorCls = slotMacroColor(entry, person, recipes, scaleBy);
     const summary = slotMacroSummary(entry, person, recipes, scaleBy);
-
     return (
-      <div className={`space-y-1 rounded p-1 border ${colorCls || "border-transparent"}`}>
+      <div className={`space-y-1 rounded p-1.5 border ${colorCls || "border-transparent"}`}>
         <select className="w-full rounded border p-1 text-xs bg-white" value={entry.main || ""} onChange={(e) => setMain(personId, day, slot, e.target.value)}>
           <option value="">— main —</option>
           {mainOptions.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
@@ -598,85 +655,118 @@ export default function Home() {
               const sr = recipes.find((r) => r.id === sid); if (!sr) return null;
               return (
                 <span key={sid} className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-800">
-                  {sr.name}
-                  <button onClick={() => removeSide(personId, day, slot, sid)} className="text-emerald-600 hover:text-red-600 font-bold">×</button>
+                  {sr.name}<button onClick={() => removeSide(personId, day, slot, sid)} className="text-emerald-600 hover:text-red-600 font-bold">×</button>
                 </span>
               );
             })}
           </div>
         )}
-        {/* Feature 1: macro feedback */}
-        {summary && <div className="text-xs text-slate-500 leading-tight">{summary}</div>}
+        {summary && <div className="text-xs text-slate-500">{summary}</div>}
+        {/* Serving override */}
+        {(entry.main || entry.sides.length > 0) && (
+          <div className="flex items-center gap-1 text-xs text-slate-500">
+            <span>Srv:</span>
+            <input type="number" min="0.5" step="0.5"
+              className="w-14 rounded border p-0.5 text-xs"
+              placeholder="auto"
+              value={entry.servingOverride ?? ""}
+              onChange={(e) => setServingOverride(personId, day, slot, e.target.value)}
+            />
+          </div>
+        )}
         {sideOptions.length > 0 && (
           isExpanded ? (
             <div className="flex gap-1">
               <select className="flex-1 rounded border p-1 text-xs" defaultValue=""
                 onChange={(e) => { if (e.target.value) { addSide(personId, day, slot, Number(e.target.value)); setExpandedSlot(null); } }}>
-                <option value="">+ pick side / dressing</option>
+                <option value="">+ pick side</option>
                 {sideOptions.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
               </select>
-              <button onClick={() => setExpandedSlot(null)} className="text-xs text-slate-400 hover:text-slate-600 px-1">✕</button>
+              <button onClick={() => setExpandedSlot(null)} className="text-xs text-slate-400 px-1">✕</button>
             </div>
           ) : (
-            <button onClick={() => setExpandedSlot(slotKey)} className="text-xs text-emerald-700 hover:underline">+ add side</button>
+            <button onClick={() => setExpandedSlot(slotKey)} className="text-xs text-emerald-700 hover:underline">+ side</button>
           )
         )}
       </div>
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // JSX
-  // ---------------------------------------------------------------------------
+  // ── Mobile planner view ──
+  function MobilePlanner({ person }: { person: FamilyMember }) {
+    return (
+      <div className="space-y-3">
+        {/* Day selector */}
+        <div className="flex gap-1 overflow-x-auto pb-1">
+          {days.map((d) => (
+            <button key={d} onClick={() => setMobileDay(d)}
+              className={`shrink-0 rounded-full px-3 py-1 text-xs font-semibold border transition-colors ${mobileDay === d ? "bg-blue-600 text-white border-blue-600" : "bg-white text-slate-500 border-slate-300"}`}>
+              {d.slice(0, 3)}
+            </button>
+          ))}
+        </div>
+        <div className="space-y-3">
+          {person.enabledSlots.map((slot) => (
+            <div key={slot} className="rounded-xl bg-slate-50 border p-3">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">{slot}</div>
+              <PlannerCell personId={person.id} day={mobileDay} slot={slot} person={person} />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // ── JSX ──
   return (
-    <main className="min-h-screen bg-slate-100 p-4 md:p-6">
-      <div className="mx-auto max-w-7xl space-y-6">
-        <h1 className="text-3xl font-bold md:text-4xl">Recipe Macro Grocery Planner</h1>
+    <main className="min-h-screen bg-slate-100 p-3 md:p-6">
+      <div className="mx-auto max-w-7xl space-y-5">
+        <h1 className="text-2xl font-bold md:text-4xl">Recipe Macro Grocery Planner</h1>
 
         {/* Main tabs */}
         <div className="flex gap-1 border-b border-slate-300 overflow-x-auto">
-          <button className={mainTabCls("planner")}  onClick={() => setActiveMainTab("planner")}>📅 Planner</button>
-          <button className={mainTabCls("summary")}  onClick={() => setActiveMainTab("summary")}>👨‍👩‍👧‍👦 Family Summary</button>
-          <button className={mainTabCls("recipes")}  onClick={() => setActiveMainTab("recipes")}>🍽 Recipes</button>
-          <button className={mainTabCls("family")}   onClick={() => setActiveMainTab("family")}>⚙️ Family Settings</button>
+          <button className={mainTabCls("planner")} onClick={() => setActiveMainTab("planner")}>📅 Planner</button>
+          <button className={mainTabCls("summary")} onClick={() => setActiveMainTab("summary")}>👨‍👩‍👧‍👦 Summary</button>
+          <button className={mainTabCls("recipes")} onClick={() => setActiveMainTab("recipes")}>🍽 Recipes</button>
+          <button className={mainTabCls("family")}  onClick={() => setActiveMainTab("family")}>⚙️ Family</button>
         </div>
 
-        {/* ══════════════════════════ PLANNER ═════════════════════════════ */}
+        {/* ══════════════════════ PLANNER ═══════════════════════════════════ */}
         {activeMainTab === "planner" && (
-          <div className="space-y-6">
+          <div className="space-y-5">
             <section className="rounded-2xl bg-white shadow overflow-hidden">
-              <div className="flex gap-1 px-4 pt-3 border-b border-slate-200 bg-slate-50 overflow-x-auto">
+              <div className="flex gap-1 px-3 pt-3 border-b border-slate-200 bg-slate-50 overflow-x-auto">
                 {family.map((p) => <button key={p.id} className={personTabCls(p.id)} onClick={() => setActivePlanTab(p.id)}>{p.name}</button>)}
               </div>
-              <div className="p-4 md:p-6">
-                <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="p-3 md:p-6">
+                <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                   <div>
-                    <h2 className="text-xl font-semibold">{activePerson?.name}'s Week</h2>
-                    <p className="text-sm text-slate-500">{activePerson?.mealCalories} cal · {activePerson?.mealProtein}g protein per meal target</p>
+                    <h2 className="text-lg font-semibold">{activePerson?.name}'s Week</h2>
+                    <p className="text-xs text-slate-500">{activePerson?.mealCalories} cal · {activePerson?.mealProtein}g pro per meal</p>
                   </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <label className="text-sm font-medium">Scale by&nbsp;
-                      <select className="rounded border p-1.5 text-sm" value={scaleBy} onChange={(e) => setScaleBy(e.target.value as "calories" | "protein")}>
-                        <option value="calories">Calories</option><option value="protein">Protein</option>
+                  <div className="flex flex-wrap gap-2">
+                    <label className="text-xs font-medium flex items-center gap-1">Scale:
+                      <select className="rounded border p-1 text-xs" value={scaleBy} onChange={(e) => setScaleBy(e.target.value as "calories" | "protein")}>
+                        <option value="calories">Cal</option><option value="protein">Protein</option>
                       </select>
                     </label>
-                    {/* Feature 7: copy week button */}
-                    <button onClick={() => { setCopyFromId(activePlanTab); setCopyToId(null); }}
-                      className="rounded border px-3 py-1.5 text-sm hover:bg-slate-50 text-slate-600">📋 Copy Week</button>
-                    <button onClick={() => clearPersonPlan(activePlanTab)} className="rounded border px-3 py-1.5 text-sm hover:bg-slate-50 text-slate-600">Clear</button>
+                    <button onClick={() => setShowSaveTemplate(true)} className="rounded border px-2 py-1 text-xs hover:bg-slate-50">💾 Save Template</button>
+                    <button onClick={() => setShowLoadTemplate(true)} className="rounded border px-2 py-1 text-xs hover:bg-slate-50">📂 Load Template</button>
+                    <button onClick={() => { setCopyFromId(activePlanTab); setCopyToId(null); }} className="rounded border px-2 py-1 text-xs hover:bg-slate-50">📋 Copy Week</button>
+                    <button onClick={() => clearPersonPlan(activePlanTab)} className="rounded border px-2 py-1 text-xs hover:bg-slate-50 text-slate-600">Clear</button>
                   </div>
                 </div>
 
-                {/* Macro legend */}
-                <div className="mb-3 flex flex-wrap gap-3 text-xs">
+                {/* Color legend */}
+                <div className="mb-2 flex flex-wrap gap-3 text-xs text-slate-500">
                   <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-green-100 border border-green-200 inline-block"></span>On target</span>
-                  <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-100 border border-blue-200 inline-block"></span>Under target</span>
-                  <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-red-100 border border-red-200 inline-block"></span>Over target</span>
+                  <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-100 border border-blue-200 inline-block"></span>Under</span>
+                  <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-red-100 border border-red-200 inline-block"></span>Over</span>
                 </div>
 
                 {/* Slot toggles */}
                 <div className="mb-3 flex flex-wrap items-center gap-2">
-                  <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Slots:</span>
+                  <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Slots:</span>
                   {allMealSlots.map((slot) => {
                     const on = activePerson?.enabledSlots.includes(slot);
                     return <button key={slot} onClick={() => toggleSlot(activePlanTab, slot)}
@@ -684,8 +774,9 @@ export default function Home() {
                   })}
                 </div>
 
-                <div className="overflow-x-auto">
-                  <table className="w-full min-w-[600px] border text-sm">
+                {/* Desktop grid */}
+                <div className="hidden md:block overflow-x-auto">
+                  <table className="w-full min-w-[640px] border text-sm">
                     <thead className="bg-slate-100">
                       <tr>
                         <th className="border p-2 text-left w-24">Day</th>
@@ -695,7 +786,7 @@ export default function Home() {
                     <tbody>
                       {days.map((day) => (
                         <tr key={day}>
-                          <td className="border p-2 font-semibold text-slate-700 whitespace-nowrap align-top">{day}</td>
+                          <td className="border p-2 font-semibold text-slate-700 whitespace-nowrap align-top text-sm">{day}</td>
                           {(activePerson?.enabledSlots ?? allMealSlots).map((slot) => (
                             <td key={slot} className="border p-1.5 align-top min-w-[150px]">
                               {activePerson && <PlannerCell personId={activePlanTab} day={day} slot={slot} person={activePerson} />}
@@ -707,22 +798,27 @@ export default function Home() {
                   </table>
                 </div>
 
+                {/* Mobile card view */}
+                <div className="md:hidden">
+                  {activePerson && <MobilePlanner person={activePerson} />}
+                </div>
+
+                {/* Weekly progress bars */}
                 {activePerson && (() => {
                   const t = calcPersonWeeklyTotals(activePerson);
+                  const weeklyTarget = (slot: keyof typeof t) => {
+                    const slots = activePerson.enabledSlots.length || 3;
+                    const perMeal = slot === "calories" ? activePerson.mealCalories : slot === "protein" ? activePerson.mealProtein : slot === "fat" ? activePerson.mealFat : slot === "carbs" ? activePerson.mealCarbs : activePerson.mealFiber;
+                    return perMeal * slots * 7;
+                  };
                   return (
-                    <div className="mt-4 grid gap-3 grid-cols-2 sm:grid-cols-5">
-                      {([
-                        { label: "Calories/wk", value: Math.round(t.calories), unit: "" },
-                        { label: "Protein/wk",  value: Math.round(t.protein),  unit: "g" },
-                        { label: "Carbs/wk",    value: Math.round(t.carbs),    unit: "g" },
-                        { label: "Fat/wk",      value: Math.round(t.fat),      unit: "g" },
-                        { label: "Fiber/wk",    value: Math.round(t.fiber),    unit: "g" },
-                      ] as { label: string; value: number; unit: string }[]).map(({ label, value, unit }) => (
-                        <div key={label} className="rounded-xl bg-slate-100 p-3">
-                          <div className="text-xs text-slate-500">{label}</div>
-                          <div className="text-xl font-semibold">{value}{unit}</div>
-                        </div>
-                      ))}
+                    <div className="mt-4 rounded-xl bg-slate-50 border p-4 space-y-3">
+                      <div className="text-sm font-semibold text-slate-700">Weekly Progress — {activePerson.name}</div>
+                      <MacroBar label="Calories" value={t.calories} target={weeklyTarget("calories")} color="bg-orange-400" />
+                      <MacroBar label="Protein"  value={t.protein}  target={weeklyTarget("protein")}  color="bg-blue-500" />
+                      <MacroBar label="Carbs"    value={t.carbs}    target={weeklyTarget("carbs")}    color="bg-yellow-400" />
+                      <MacroBar label="Fat"      value={t.fat}      target={weeklyTarget("fat")}      color="bg-purple-400" />
+                      <MacroBar label="Fiber"    value={t.fiber}    target={weeklyTarget("fiber")}    color="bg-green-500" />
                     </div>
                   );
                 })()}
@@ -730,9 +826,17 @@ export default function Home() {
             </section>
 
             {/* Grocery List */}
-            <section className="rounded-2xl bg-white p-4 shadow md:p-6">
-              <h2 className="mb-1 text-2xl font-semibold">Combined Grocery List</h2>
-              <p className="mb-4 text-sm text-slate-500">{family.length} family members · {totalPlannedMeals} meals · scaled per person to their individual targets</p>
+            <section className="rounded-2xl bg-white p-3 shadow md:p-6">
+              <div className="flex items-center justify-between mb-1">
+                <h2 className="text-xl font-semibold">Grocery List</h2>
+                <div className="flex gap-2">
+                  {checkedItems.size > 0 && (
+                    <button onClick={clearChecks} className="text-xs text-slate-500 hover:text-slate-700 border rounded px-2 py-1">Clear checks</button>
+                  )}
+                  <button onClick={() => window.print()} className="text-xs border rounded px-2 py-1 hover:bg-slate-50">🖨 Print</button>
+                </div>
+              </div>
+              <p className="mb-4 text-xs text-slate-500">{family.length} people · {totalPlannedMeals} meals · scaled per person</p>
               {totalPlannedMeals === 0 ? (
                 <div className="rounded border border-dashed p-6 text-center text-slate-400">Plan some meals above to generate a grocery list.</div>
               ) : (
@@ -744,13 +848,19 @@ export default function Home() {
                       <div key={section}>
                         <h3 className="mb-2 font-semibold text-slate-700 border-b pb-1">{section}</h3>
                         <div className="space-y-0.5">
-                          {items.map((d) => (
-                            <div key={`${d.item}-${d.unit}`} className="flex justify-between py-1.5 text-sm border-b border-slate-100 last:border-0">
-                              <span className="capitalize">{d.item}</span>
-                              {/* Feature 3: human-friendly quantities */}
-                              <span className="text-slate-500 tabular-nums">{formatQty(d.qty, d.unit)}</span>
-                            </div>
-                          ))}
+                          {items.map((d) => {
+                            const key = `${d.item}|${d.unit}`;
+                            const checked = checkedItems.has(key);
+                            return (
+                              <label key={key} className={`flex items-center justify-between py-1.5 border-b border-slate-100 last:border-0 cursor-pointer gap-2 ${checked ? "opacity-40" : ""}`}>
+                                <div className="flex items-center gap-2">
+                                  <input type="checkbox" checked={checked} onChange={() => toggleCheck(key)} className="rounded" />
+                                  <span className={`capitalize text-sm ${checked ? "line-through" : ""}`}>{d.item}</span>
+                                </div>
+                                <span className="text-slate-500 text-sm tabular-nums shrink-0">{formatQty(d.qty, d.unit)}</span>
+                              </label>
+                            );
+                          })}
                         </div>
                       </div>
                     );
@@ -761,35 +871,47 @@ export default function Home() {
           </div>
         )}
 
-        {/* ══════════════════════════ FAMILY SUMMARY ══════════════════════ */}
-        {/* Feature 4: family summary view */}
+        {/* ══════════════════════ FAMILY SUMMARY ════════════════════════════ */}
         {activeMainTab === "summary" && (
           <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xl font-semibold">All Family Plans at a Glance</h2>
-              <label className="text-sm font-medium">Scale by&nbsp;
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <h2 className="text-xl font-semibold">Family Week at a Glance</h2>
+              <label className="text-sm font-medium flex items-center gap-1">Scale:
                 <select className="rounded border p-1.5 text-sm" value={scaleBy} onChange={(e) => setScaleBy(e.target.value as "calories" | "protein")}>
                   <option value="calories">Calories</option><option value="protein">Protein</option>
                 </select>
               </label>
             </div>
+            {/* Per-person weekly progress */}
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              {family.map((person) => {
+                const t = calcPersonWeeklyTotals(person);
+                const slots = person.enabledSlots.length || 3;
+                return (
+                  <div key={person.id} className="rounded-2xl bg-white border shadow p-4 space-y-3">
+                    <div className="font-semibold text-slate-700">{person.name}</div>
+                    <MacroBar label="Calories" value={t.calories} target={person.mealCalories * slots * 7} color="bg-orange-400" />
+                    <MacroBar label="Protein"  value={t.protein}  target={person.mealProtein  * slots * 7} color="bg-blue-500" />
+                    <MacroBar label="Carbs"    value={t.carbs}    target={person.mealCarbs    * slots * 7} color="bg-yellow-400" />
+                  </div>
+                );
+              })}
+            </div>
+            {/* Day-by-day grid */}
             {days.map((day) => (
               <div key={day} className="rounded-2xl bg-white shadow overflow-hidden">
-                <div className="bg-slate-100 px-4 py-2 font-semibold text-slate-700">{day}</div>
+                <div className="bg-slate-100 px-4 py-2 font-semibold text-slate-700 text-sm">{day}</div>
                 <div className="overflow-x-auto">
-                  <table className="w-full min-w-[600px] text-sm">
+                  <table className="w-full min-w-[500px] text-xs">
                     <thead className="bg-slate-50">
                       <tr>
-                        <th className="border p-2 text-left w-24">Slot</th>
+                        <th className="border p-2 text-left w-20">Slot</th>
                         {family.map((p) => <th key={p.id} className="border p-2 text-center">{p.name}</th>)}
                       </tr>
                     </thead>
                     <tbody>
                       {allMealSlots.map((slot) => {
-                        const anyPlanned = family.some((p) => {
-                          const e = personMealPlan[p.id]?.[day]?.[slot];
-                          return e && (e.main || e.sides.length > 0);
-                        });
+                        const anyPlanned = family.some((p) => { const e = personMealPlan[p.id]?.[day]?.[slot]; return e && (e.main || e.sides.length > 0); });
                         if (!anyPlanned) return null;
                         return (
                           <tr key={slot}>
@@ -797,16 +919,12 @@ export default function Home() {
                             {family.map((p) => {
                               const entry = personMealPlan[p.id]?.[day]?.[slot] ?? emptyMealEntry();
                               const ids = entryRecipeIds(entry);
-                              const colorCls = slotMacroColor(entry, p, recipes, scaleBy);
                               return (
-                                <td key={p.id} className={`border p-2 text-xs align-top ${colorCls}`}>
+                                <td key={p.id} className={`border p-2 align-top ${slotMacroColor(entry, p, recipes, scaleBy)}`}>
                                   {ids.length === 0 ? <span className="text-slate-300">—</span> : (
                                     <div className="space-y-0.5">
-                                      {ids.map((rid) => {
-                                        const r = recipes.find((x) => x.id === rid);
-                                        return r ? <div key={rid} className="truncate max-w-[120px]">{r.name}</div> : null;
-                                      })}
-                                      <div className="text-slate-500 text-xs">{slotMacroSummary(entry, p, recipes, scaleBy)}</div>
+                                      {ids.map((rid) => { const r = recipes.find((x) => x.id === rid); return r ? <div key={rid} className="truncate max-w-[110px]">{r.name}</div> : null; })}
+                                      <div className="text-slate-400">{slotMacroSummary(entry, p, recipes, scaleBy)}</div>
                                     </div>
                                   )}
                                 </td>
@@ -823,11 +941,26 @@ export default function Home() {
           </div>
         )}
 
-        {/* ══════════════════════════ RECIPES ══════════════════════════════ */}
+        {/* ══════════════════════ RECIPES ═══════════════════════════════════ */}
         {activeMainTab === "recipes" && (
-          <div className="space-y-6">
+          <div className="space-y-5">
+            {/* URL import */}
+            <section className="rounded-2xl bg-white p-4 shadow">
+              <h2 className="mb-3 text-lg font-semibold">🔗 Import Recipe from URL</h2>
+              <div className="flex gap-2 flex-wrap">
+                <input ref={importRef} className="flex-1 min-w-0 rounded border p-2 text-sm" placeholder="Paste a recipe URL (AllRecipes, Food Network, etc.)"
+                  value={urlImportValue} onChange={(e) => setUrlImportValue(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") importFromUrl(); }} />
+                <button onClick={importFromUrl} disabled={isImporting || !urlImportValue.trim()} className="rounded bg-purple-600 px-4 py-2 text-sm text-white disabled:bg-slate-400 whitespace-nowrap">
+                  {isImporting ? "Importing..." : "Import"}
+                </button>
+              </div>
+              {importStatus && <p className="mt-2 text-sm text-slate-600">{importStatus}</p>}
+            </section>
+
+            {/* Add/Edit form */}
             <section className="rounded-2xl bg-white p-4 shadow md:p-6">
-              <h2 className="mb-4 text-2xl font-semibold">{editingRecipeId ? "Edit Recipe" : "Add Recipe"}</h2>
+              <h2 className="mb-4 text-xl font-semibold">{editingRecipeId ? "Edit Recipe" : "Add Recipe"}</h2>
               <div className="grid gap-4 md:grid-cols-2">
                 <label className="block">
                   <span className="mb-1 block text-sm font-medium">Recipe Name</span>
@@ -850,13 +983,18 @@ export default function Home() {
                   </label>
                 ))}
                 <label className="block md:col-span-2">
-                  <span className="mb-1 block text-sm font-medium">Ingredients (one per line — e.g. "1 lb chicken breast")</span>
-                  <textarea className="min-h-32 w-full rounded border p-2 font-mono text-sm" value={ingredientsText} onChange={(e) => setIngredientsText(e.target.value)} />
+                  <span className="mb-1 block text-sm font-medium">Ingredients (one per line)</span>
+                  <textarea className="min-h-28 w-full rounded border p-2 font-mono text-sm" value={ingredientsText} onChange={(e) => setIngredientsText(e.target.value)} />
+                </label>
+                {/* Feature: recipe notes */}
+                <label className="block md:col-span-2">
+                  <span className="mb-1 block text-sm font-medium">Instructions / Notes</span>
+                  <textarea className="min-h-20 w-full rounded border p-2 text-sm" value={recipeForm.notes} onChange={(e) => updateRecipeField("notes", e.target.value)} placeholder="Cooking steps, prep tips, variations..." />
                 </label>
                 <p className="text-sm text-slate-600 md:col-span-2">{usdaStatus}</p>
                 {matchLog.length > 0 && (
                   <div className="rounded bg-slate-50 p-3 text-sm md:col-span-2 space-y-1">
-                    <div className="font-semibold mb-2">Nutrition Sources Used</div>
+                    <div className="font-semibold mb-1">Nutrition Sources Used</div>
                     {matchLog.map((m) => (
                       <div key={`${m.ingredient}-${m.matched}`} className="flex items-start gap-2 border-b pb-1 last:border-0">
                         <span className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-xs font-bold ${m.source === "local" ? "bg-emerald-100 text-emerald-800" : "bg-blue-100 text-blue-800"}`}>
@@ -881,17 +1019,12 @@ export default function Home() {
               </div>
             </section>
 
-            {/* Feature 2: search + filter */}
+            {/* Saved recipes */}
             <section className="rounded-2xl bg-white p-4 shadow md:p-6">
               <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <h2 className="text-2xl font-semibold">Saved Recipes ({filteredRecipes.length}{filteredRecipes.length !== recipes.length ? ` of ${recipes.length}` : ""})</h2>
+                <h2 className="text-xl font-semibold">Saved Recipes ({filteredRecipes.length}{filteredRecipes.length !== recipes.length ? ` of ${recipes.length}` : ""})</h2>
                 <div className="flex gap-2 flex-wrap">
-                  <input
-                    className="rounded border p-2 text-sm w-48"
-                    placeholder="🔍 Search recipes..."
-                    value={recipeSearch}
-                    onChange={(e) => setRecipeSearch(e.target.value)}
-                  />
+                  <input className="rounded border p-2 text-sm w-44" placeholder="🔍 Search..." value={recipeSearch} onChange={(e) => setRecipeSearch(e.target.value)} />
                   <select className="rounded border p-2 text-sm" value={recipeCatFilter} onChange={(e) => setRecipeCatFilter(e.target.value)}>
                     <option value="All">All categories</option>
                     {ALL_CATEGORIES.map((c) => <option key={c}>{c}</option>)}
@@ -900,29 +1033,38 @@ export default function Home() {
               </div>
               {filteredRecipes.length === 0 ? (
                 <div className="rounded border border-dashed p-6 text-center text-slate-400">
-                  {recipes.length === 0 ? "No recipes yet — add one above." : "No recipes match your search."}
+                  {recipes.length === 0 ? "No recipes yet — add one above or import from a URL." : "No recipes match your search."}
                 </div>
               ) : (
                 <div className="space-y-2">
                   {filteredRecipes.map((recipe) => (
                     <div key={recipe.id} className="rounded border p-3 hover:bg-slate-50 transition-colors">
                       <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
-                        <div>
-                          <div className="font-semibold">{recipe.name}
+                        <div className="min-w-0">
+                          <div className="font-semibold flex items-center gap-2 flex-wrap">
+                            {recipe.name}
                             {["Side","Dressing"].includes(recipe.category) && (
-                              <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700 font-medium">{recipe.category}</span>
+                              <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700 font-medium">{recipe.category}</span>
                             )}
                           </div>
-                          <div className="text-sm text-slate-500">{recipe.category}{recipe.tags ? ` · ${recipe.tags}` : ""}</div>
-                          <div className="text-sm text-slate-500">
-                            {recipe.servings} srv · {recipe.calories} cal · {recipe.protein}g pro · {recipe.fat}g fat · {recipe.carbs}g carbs · {recipe.fiber}g fiber
-                          </div>
+                          <div className="text-xs text-slate-500">{recipe.category}{recipe.tags ? ` · ${recipe.tags}` : ""}</div>
+                          <div className="text-xs text-slate-500">{recipe.servings} srv · {recipe.calories} cal · {recipe.protein}g pro · {recipe.fat}g fat · {recipe.carbs}g carbs · {recipe.fiber}g fiber</div>
+                          {/* Notes expand */}
+                          {recipe.notes && (
+                            <div className="mt-1">
+                              <button onClick={() => setExpandedNotes(expandedNotes === recipe.id ? null : recipe.id)} className="text-xs text-blue-600 hover:underline">
+                                {expandedNotes === recipe.id ? "▲ Hide notes" : "▼ Show notes"}
+                              </button>
+                              {expandedNotes === recipe.id && (
+                                <div className="mt-1 text-xs text-slate-600 whitespace-pre-wrap bg-slate-50 rounded p-2 border">{recipe.notes}</div>
+                              )}
+                            </div>
+                          )}
                         </div>
-                        <div className="flex gap-2 shrink-0">
-                          <button onClick={() => editRecipe(recipe)} className="rounded border px-3 py-1.5 text-sm hover:bg-slate-100">Edit</button>
-                          {/* Feature 5: duplicate */}
-                          <button onClick={() => duplicateRecipe(recipe)} className="rounded border px-3 py-1.5 text-sm hover:bg-slate-100" title="Duplicate recipe">⧉ Copy</button>
-                          <button onClick={() => requestDeleteRecipe(recipe.id)} className="rounded bg-red-600 px-3 py-1.5 text-sm text-white hover:bg-red-700">Delete</button>
+                        <div className="flex gap-2 shrink-0 flex-wrap">
+                          <button onClick={() => editRecipe(recipe)} className="rounded border px-3 py-1.5 text-xs hover:bg-slate-100">Edit</button>
+                          <button onClick={() => duplicateRecipe(recipe)} className="rounded border px-3 py-1.5 text-xs hover:bg-slate-100">⧉ Copy</button>
+                          <button onClick={() => requestDeleteRecipe(recipe.id)} className="rounded bg-red-600 px-3 py-1.5 text-xs text-white hover:bg-red-700">Delete</button>
                         </div>
                       </div>
                     </div>
@@ -933,33 +1075,28 @@ export default function Home() {
           </div>
         )}
 
-        {/* ══════════════════════════ FAMILY SETTINGS ══════════════════════ */}
+        {/* ══════════════════════ FAMILY SETTINGS ═══════════════════════════ */}
         {activeMainTab === "family" && (
           <section className="rounded-2xl bg-white p-4 shadow md:p-6">
-            <h2 className="mb-1 text-2xl font-semibold">Family Settings</h2>
-            <p className="mb-4 text-sm text-slate-500">Set per-meal nutrition targets and toggle which meal slots each person uses.</p>
+            <h2 className="mb-1 text-xl font-semibold">Family Settings</h2>
+            <p className="mb-4 text-sm text-slate-500">Set per-meal nutrition targets and toggle meal slots.</p>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[800px] border text-sm">
+              <table className="w-full min-w-[700px] border text-sm">
                 <thead className="bg-slate-100">
                   <tr>
                     <th className="border p-2 text-left">Name</th>
-                    <th className="border p-2">Calories</th>
-                    <th className="border p-2">Protein (g)</th>
-                    <th className="border p-2">Fat (g)</th>
-                    <th className="border p-2">Carbs (g)</th>
-                    <th className="border p-2">Fiber (g)</th>
-                    <th className="border p-2 text-left">Meal Slots</th>
+                    <th className="border p-2">Cal</th><th className="border p-2">Pro (g)</th>
+                    <th className="border p-2">Fat (g)</th><th className="border p-2">Carbs (g)</th>
+                    <th className="border p-2">Fiber (g)</th><th className="border p-2 text-left">Slots</th>
                   </tr>
                 </thead>
                 <tbody>
                   {family.map((person) => (
                     <tr key={person.id} className="hover:bg-slate-50">
-                      <td className="border p-2">
-                        <input className="w-28 rounded border p-1" value={person.name} onChange={(e) => updateFamily(person.id, "name", e.target.value)} />
-                      </td>
+                      <td className="border p-2"><input className="w-24 rounded border p-1" value={person.name} onChange={(e) => updateFamily(person.id, "name", e.target.value)} /></td>
                       {(["mealCalories","mealProtein","mealFat","mealCarbs","mealFiber"] as const).map((field) => (
                         <td key={field} className="border p-2 text-center">
-                          <input className="w-20 rounded border p-1 text-center" type="number" value={person[field]} onChange={(e) => updateFamily(person.id, field, e.target.value)} />
+                          <input className="w-16 rounded border p-1 text-center" type="number" value={person[field]} onChange={(e) => updateFamily(person.id, field, e.target.value)} />
                         </td>
                       ))}
                       <td className="border p-2">
@@ -980,31 +1117,31 @@ export default function Home() {
           </section>
         )}
 
-        {/* ══════════════ FEATURE 6: Delete confirmation modal ════════════ */}
+        {/* ══════════ MODALS ════════════════════════════════════════════════ */}
+
+        {/* Delete confirm */}
         {confirmDeleteId !== null && (() => {
           const recipe = recipes.find((r) => r.id === confirmDeleteId);
           return (
             <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
               <div className="bg-white rounded-2xl shadow-xl p-6 max-w-sm w-full space-y-4">
                 <h3 className="text-lg font-semibold">Delete "{recipe?.name}"?</h3>
-                <p className="text-sm text-slate-600">This recipe is currently used in one or more meal plans. Deleting it will remove it from all plans.</p>
+                <p className="text-sm text-slate-600">This recipe is used in one or more meal plans and will be removed from them.</p>
                 <div className="flex gap-3 justify-end">
                   <button onClick={() => setConfirmDeleteId(null)} className="rounded border px-4 py-2 text-sm hover:bg-slate-50">Cancel</button>
-                  <button onClick={() => confirmDeleteRecipe(confirmDeleteId)} className="rounded bg-red-600 px-4 py-2 text-sm text-white hover:bg-red-700">Yes, Delete</button>
+                  <button onClick={() => confirmDeleteRecipe(confirmDeleteId)} className="rounded bg-red-600 px-4 py-2 text-sm text-white">Yes, Delete</button>
                 </div>
               </div>
             </div>
           );
         })()}
 
-        {/* ══════════════ FEATURE 7: Copy week modal ══════════════════════ */}
+        {/* Copy week */}
         {copyFromId !== null && (
           <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
             <div className="bg-white rounded-2xl shadow-xl p-6 max-w-sm w-full space-y-4">
               <h3 className="text-lg font-semibold">Copy Week</h3>
-              <p className="text-sm text-slate-600">
-                Copy <strong>{family.find((p) => p.id === copyFromId)?.name}'s</strong> entire week to another person. This will overwrite their current plan.
-              </p>
+              <p className="text-sm text-slate-600">Copy <strong>{family.find((p) => p.id === copyFromId)?.name}'s</strong> week to another person. Overwrites their current plan.</p>
               <label className="block">
                 <span className="mb-1 block text-sm font-medium">Copy to:</span>
                 <select className="w-full rounded border p-2" value={copyToId ?? ""} onChange={(e) => setCopyToId(e.target.value ? Number(e.target.value) : null)}>
@@ -1014,7 +1151,53 @@ export default function Home() {
               </label>
               <div className="flex gap-3 justify-end">
                 <button onClick={() => { setCopyFromId(null); setCopyToId(null); }} className="rounded border px-4 py-2 text-sm hover:bg-slate-50">Cancel</button>
-                <button onClick={copyWeek} disabled={!copyToId} className="rounded bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700 disabled:bg-slate-400">Copy Week</button>
+                <button onClick={copyWeek} disabled={!copyToId} className="rounded bg-blue-600 px-4 py-2 text-sm text-white disabled:bg-slate-400">Copy Week</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Save template */}
+        {showSaveTemplate && (
+          <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-2xl shadow-xl p-6 max-w-sm w-full space-y-4">
+              <h3 className="text-lg font-semibold">Save as Template</h3>
+              <p className="text-sm text-slate-600">Save the current week plan for all family members as a reusable template.</p>
+              <label className="block">
+                <span className="mb-1 block text-sm font-medium">Template name:</span>
+                <input className="w-full rounded border p-2" placeholder="e.g. High Protein Week" value={templateName} onChange={(e) => setTemplateName(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") saveTemplate(); }} />
+              </label>
+              <div className="flex gap-3 justify-end">
+                <button onClick={() => setShowSaveTemplate(false)} className="rounded border px-4 py-2 text-sm hover:bg-slate-50">Cancel</button>
+                <button onClick={saveTemplate} disabled={!templateName.trim()} className="rounded bg-blue-600 px-4 py-2 text-sm text-white disabled:bg-slate-400">Save</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Load template */}
+        {showLoadTemplate && (
+          <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-2xl shadow-xl p-6 max-w-sm w-full space-y-4">
+              <h3 className="text-lg font-semibold">Load Template</h3>
+              {weekTemplates.length === 0 ? (
+                <p className="text-sm text-slate-500">No templates saved yet. Plan a week and click "Save Template".</p>
+              ) : (
+                <div className="space-y-2 max-h-64 overflow-y-auto">
+                  {weekTemplates.map((t) => (
+                    <div key={t.id} className="flex items-center justify-between rounded border p-3">
+                      <span className="text-sm font-medium">{t.name}</span>
+                      <div className="flex gap-2">
+                        <button onClick={() => loadTemplate(t)} className="rounded bg-blue-600 px-3 py-1 text-xs text-white hover:bg-blue-700">Load</button>
+                        <button onClick={() => deleteTemplate(t.id)} className="rounded border px-3 py-1 text-xs hover:bg-red-50 text-red-600">Del</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="flex justify-end">
+                <button onClick={() => setShowLoadTemplate(false)} className="rounded border px-4 py-2 text-sm hover:bg-slate-50">Close</button>
               </div>
             </div>
           </div>
