@@ -37,8 +37,19 @@ type MealSlot = "Breakfast" | "Lunch" | "Dinner" | "Snack";
 
 type MealPlan = Record<string, Record<MealSlot, number | "">>;
 
-const STORAGE_KEY = "recipe-planner-phase-2-v1";
-const OLD_STORAGE_KEY = "recipe-planner-phase-1-v1";
+type UsdaFoodNutrient = {
+  nutrientName?: string;
+  value?: number;
+  unitName?: string;
+};
+
+type UsdaFood = {
+  description?: string;
+  foodNutrients?: UsdaFoodNutrient[];
+};
+
+const STORAGE_KEY = "recipe-planner-phase-2-usda-v1";
+const OLD_STORAGE_KEY = "recipe-planner-phase-2-v1";
 
 const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 const mealSlots: MealSlot[] = ["Breakfast", "Lunch", "Dinner", "Snack"];
@@ -130,6 +141,30 @@ function blankRecipe(): Recipe {
   };
 }
 
+function getNutrient(food: UsdaFood, names: string[]) {
+  const nutrient = food.foodNutrients?.find((item) => {
+    const nutrientName = item.nutrientName?.toLowerCase() || "";
+    return names.some((name) => nutrientName.includes(name));
+  });
+
+  return Number(nutrient?.value || 0);
+}
+
+function unitToApproxGramMultiplier(unit: string) {
+  const normalized = unit.toLowerCase();
+
+  if (["g", "gram", "grams"].includes(normalized)) return 1;
+  if (["kg", "kilogram", "kilograms"].includes(normalized)) return 1000;
+  if (["oz", "ounce", "ounces"].includes(normalized)) return 28.35;
+  if (["lb", "lbs", "pound", "pounds"].includes(normalized)) return 453.6;
+  if (["cup", "cups"].includes(normalized)) return 240;
+  if (["tbsp", "tablespoon", "tablespoons"].includes(normalized)) return 15;
+  if (["tsp", "teaspoon", "teaspoons"].includes(normalized)) return 5;
+  if (["each", "ea", "ct", "count"].includes(normalized)) return 100;
+
+  return 100;
+}
+
 export default function Home() {
   const [family, setFamily] = useState<FamilyMember[]>(defaultFamily);
   const [recipes, setRecipes] = useState<Recipe[]>([]);
@@ -138,6 +173,8 @@ export default function Home() {
   const [ingredientsText, setIngredientsText] = useState("1 lb chicken breast\n8 each tortillas\n1 cup salsa");
   const [scaleBy, setScaleBy] = useState<"calories" | "protein">("calories");
   const [mealPlan, setMealPlan] = useState<MealPlan>(createEmptyMealPlan());
+  const [usdaStatus, setUsdaStatus] = useState("USDA estimate will search the first USDA result for each ingredient. Review before saving.");
+  const [isEstimating, setIsEstimating] = useState(false);
 
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(OLD_STORAGE_KEY);
@@ -169,6 +206,71 @@ export default function Home() {
       ...current,
       [field]: ["name", "category", "tags"].includes(field) ? value : Number(value),
     }));
+  }
+
+  async function estimateNutritionFromUsda() {
+    const ingredients = ingredientsText
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map(parseIngredientLine);
+
+    if (ingredients.length === 0) {
+      setUsdaStatus("Add ingredients first, then run USDA estimate.");
+      return;
+    }
+
+    setIsEstimating(true);
+    setUsdaStatus("Searching USDA nutrition data...");
+
+    const total = { calories: 0, protein: 0, fat: 0, carbs: 0, fiber: 0 };
+    const matched: string[] = [];
+    const missed: string[] = [];
+
+    try {
+      for (const ingredient of ingredients) {
+        const response = await fetch(`/api/usda/search?query=${encodeURIComponent(ingredient.item)}`);
+        if (!response.ok) {
+          missed.push(ingredient.item);
+          continue;
+        }
+
+        const data = await response.json();
+        const food: UsdaFood | undefined = data.foods?.[0];
+        if (!food) {
+          missed.push(ingredient.item);
+          continue;
+        }
+
+        const grams = ingredient.qty * unitToApproxGramMultiplier(ingredient.unit);
+        const multiplier = grams / 100;
+
+        total.calories += getNutrient(food, ["energy"]) * multiplier;
+        total.protein += getNutrient(food, ["protein"]) * multiplier;
+        total.fat += getNutrient(food, ["total lipid", "fat"]) * multiplier;
+        total.carbs += getNutrient(food, ["carbohydrate"]) * multiplier;
+        total.fiber += getNutrient(food, ["fiber"]) * multiplier;
+        matched.push(`${ingredient.item} → ${food.description || "USDA match"}`);
+      }
+
+      const divisor = recipeForm.servings || 1;
+
+      setRecipeForm((current) => ({
+        ...current,
+        calories: Math.round(total.calories / divisor),
+        protein: Math.round(total.protein / divisor),
+        fat: Math.round(total.fat / divisor),
+        carbs: Math.round(total.carbs / divisor),
+        fiber: Math.round(total.fiber / divisor),
+      }));
+
+      const missedText = missed.length ? ` Not matched: ${missed.join(", ")}.` : "";
+      setUsdaStatus(`USDA estimate complete. Matched ${matched.length} ingredient(s).${missedText} Review values before saving.`);
+    } catch (error) {
+      setUsdaStatus("USDA estimate failed. Check the API route and try again.");
+    } finally {
+      setIsEstimating(false);
+    }
   }
 
   function saveRecipe() {
@@ -382,7 +484,12 @@ export default function Home() {
               <textarea className="min-h-32 w-full rounded border p-2" value={ingredientsText} onChange={(e) => setIngredientsText(e.target.value)} placeholder="One ingredient per line, example: 1 lb chicken breast" />
             </label>
 
+            <p className="text-sm text-slate-600 md:col-span-2">{usdaStatus}</p>
+
             <div className="flex flex-wrap gap-3 md:col-span-2">
+              <button onClick={estimateNutritionFromUsda} disabled={isEstimating} className="rounded bg-green-600 px-4 py-2 text-white disabled:bg-slate-400">
+                {isEstimating ? "Estimating..." : "Estimate Nutrition from USDA"}
+              </button>
               <button onClick={saveRecipe} className="rounded bg-blue-600 px-4 py-2 text-white">
                 {editingRecipeId ? "Update Recipe" : "Save Recipe"}
               </button>
